@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nextcloud-file-control"
+version = "1.0.0"
+description = "Nextcloud ExApp for collection and audit of files"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+  "aiosqlite==0.21.0",
+  "asyncpg==0.30.0",
+  "fastapi==0.141.1",
+  "nc-py-api[app]==0.30.3",
+  "openpyxl==3.1.5",
+  "pydantic-settings==2.15.0",
+  "python-multipart==0.0.20",
+  "SQLAlchemy==2.0.52",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.2",
+  "pytest-asyncio==1.2.0",
+  "ruff==0.13.1",
+]
+
+[project.scripts]
+file-control = "file_control.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/file_control"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
