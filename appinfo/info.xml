@@ -18,7 +18,7 @@
 	<external-app>
 		<docker-install>
 			<registry>ghcr.io</registry>
-			<image>kyasu-404/file_control</image>
+			<image>kyasu-404/file-control</image>
 			<image-tag>1.0.0</image-tag>
 		</docker-install>
 		<routes>
