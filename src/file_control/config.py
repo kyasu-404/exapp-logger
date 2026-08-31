@@ -12,16 +12,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     app_id: str = Field(default="file_control", validation_alias="APP_ID")
-    app_version: str = Field(default="1.0.0", validation_alias="APP_VERSION")
-    app_display_name: str = Field(default="Сбор и контроль файлов", validation_alias="APP_DISPLAY_NAME")
+    app_version: str = Field(default="2.3.0", validation_alias="APP_VERSION")
+    app_display_name: str = Field(default="Отчёт сдачи", validation_alias="APP_DISPLAY_NAME")
     app_persistent_storage: str = Field(default="./data", validation_alias="APP_PERSISTENT_STORAGE")
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
     debug: bool = Field(default=False, validation_alias="DEBUG")
+    app_timezone: str = Field(default="Europe/Moscow", validation_alias="APP_TIMEZONE")
     reconcile_interval_minutes: int = Field(default=45, ge=5, le=1440, validation_alias="RECONCILE_INTERVAL_MINUTES")
     admin_groups: str = Field(default="admin,file_control_admins", validation_alias="ADMIN_GROUPS")
     observer_groups: str = Field(default="file_control_observers", validation_alias="OBSERVER_GROUPS")
-    max_upload_mb: int = Field(default=20, ge=1, le=200, validation_alias="MAX_UPLOAD_MB")
 
     @property
     def storage_path(self) -> Path:

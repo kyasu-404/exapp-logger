@@ -3,113 +3,74 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import CampaignStatus, StructureMode
+from .models import ReportCadence, WatchStatus
 
 
 class APIModel(BaseModel):
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
-class OrganizationCreate(APIModel):
-    code: str = Field(min_length=1, max_length=100)
-    name: str = Field(min_length=1, max_length=500)
-    short_name: str = Field(default="", max_length=255)
-    folder_name: str = Field(min_length=1, max_length=255)
-    email: str = Field(default="", max_length=320)
-    active: bool = True
-    extra_fields: dict[str, Any] = Field(default_factory=dict)
+def normalize_path(value: str) -> str:
+    normalized = "/" + value.strip().replace("\\", "/").strip("/")
+    if normalized == "/":
+        raise ValueError("Нельзя наблюдать корень всего хранилища")
+    return normalized
 
-    @field_validator("code", "name", "short_name", "folder_name", "email")
+
+class WatchCreate(APIModel):
+    name: str = Field(min_length=1, max_length=500)
+    root_path: str = Field(min_length=1, max_length=4096)
+    owner_user_id: str | None = Field(default=None, max_length=255)
+    scope_type: Literal["personal", "team"] = "personal"
+    group_ids: list[str] = Field(default_factory=list, max_length=200)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    status: WatchStatus = WatchStatus.ACTIVE
+
+    @field_validator("name")
     @classmethod
-    def strip_text(cls, value: str) -> str:
+    def strip_name(cls, value: str) -> str:
         return value.strip()
-
-
-class OrganizationUpdate(APIModel):
-    code: str | None = Field(default=None, min_length=1, max_length=100)
-    name: str | None = Field(default=None, min_length=1, max_length=500)
-    short_name: str | None = Field(default=None, max_length=255)
-    folder_name: str | None = Field(default=None, min_length=1, max_length=255)
-    email: str | None = Field(default=None, max_length=320)
-    active: bool | None = None
-    extra_fields: dict[str, Any] | None = None
-
-
-class DimensionValueInput(APIModel):
-    value: str = Field(min_length=1, max_length=500)
-    display_name: str | None = Field(default=None, max_length=500)
-    sort_order: int = 0
-    active: bool = True
-
-
-class DimensionInput(APIModel):
-    key: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_\-]*$", max_length=100)
-    name: str = Field(min_length=1, max_length=255)
-    required: bool = True
-    fixed: bool = True
-    values: list[DimensionValueInput] = Field(default_factory=list)
-
-
-class CampaignCreate(APIModel):
-    name: str = Field(min_length=1, max_length=500)
-    campaign_type: str = Field(default="collection", max_length=100)
-    year: int = Field(ge=2000, le=2200)
-    description: str = ""
-    root_path: str = Field(min_length=1, max_length=2048)
-    storage_user_id: str | None = Field(default=None, max_length=255)
-    start_at: datetime | None = None
-    deadline_at: datetime | None = None
-    status: CampaignStatus = CampaignStatus.DRAFT
-    structure_mode: StructureMode = StructureMode.STRICT
-    requirements_mode: Literal["simple", "matrix"] = "simple"
-    organization_ids: list[int] = Field(default_factory=list)
-    dimensions: list[DimensionInput] = Field(default_factory=list)
-    settings: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("root_path")
     @classmethod
     def normalize_root(cls, value: str) -> str:
-        normalized = "/" + value.strip().replace("\\", "/").strip("/")
-        if normalized == "/":
-            raise ValueError("Корневая папка кампании не может быть корнем хранилища")
-        return normalized
+        return normalize_path(value)
+
+    @model_validator(mode="after")
+    def valid_period(self):
+        if self.started_at and self.ended_at and self.ended_at < self.started_at:
+            raise ValueError("Дата окончания не может быть раньше даты начала")
+        self.group_ids = sorted({item.strip() for item in self.group_ids if item.strip()})
+        return self
 
 
-class CampaignUpdate(APIModel):
+class WatchUpdate(APIModel):
     name: str | None = Field(default=None, min_length=1, max_length=500)
-    campaign_type: str | None = Field(default=None, max_length=100)
-    year: int | None = Field(default=None, ge=2000, le=2200)
-    description: str | None = None
-    root_path: str | None = Field(default=None, min_length=1, max_length=2048)
-    storage_user_id: str | None = Field(default=None, max_length=255)
-    start_at: datetime | None = None
-    deadline_at: datetime | None = None
-    status: CampaignStatus | None = None
-    structure_mode: StructureMode | None = None
-    requirements_mode: Literal["simple", "matrix"] | None = None
-    organization_ids: list[int] | None = None
-    dimensions: list[DimensionInput] | None = None
-    settings: dict[str, Any] | None = None
-    confirm_reclassification: bool = False
+    root_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    owner_user_id: str | None = Field(default=None, max_length=255)
+    scope_type: Literal["personal", "team"] | None = None
+    group_ids: list[str] | None = Field(default=None, max_length=200)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    status: WatchStatus | None = None
 
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
-class CampaignClone(APIModel):
-    name: str = Field(min_length=1, max_length=500)
-    year: int = Field(ge=2000, le=2200)
-    root_path: str = Field(min_length=1, max_length=2048)
-    start_at: datetime | None = None
-    deadline_at: datetime | None = None
-    copy_requirements: bool = True
+    @field_validator("root_path")
+    @classmethod
+    def normalize_root(cls, value: str | None) -> str | None:
+        return normalize_path(value) if value is not None else None
 
-
-class RequirementInput(APIModel):
-    organization_id: int
-    dimensions: dict[str, str] = Field(default_factory=dict)
-    required: bool = True
-    required_file_count: int = Field(default=1, ge=1, le=1000)
-    deadline_at: datetime | None = None
+    @field_validator("group_ids")
+    @classmethod
+    def normalize_groups(cls, value: list[str] | None) -> list[str] | None:
+        return sorted({item.strip() for item in value if item.strip()}) if value is not None else None
 
 
 class Page(APIModel):
@@ -120,9 +81,23 @@ class Page(APIModel):
     pages: int
 
 
-class ImportPreview(APIModel):
-    rows: int
-    to_add: int
-    to_update: int
-    errors: list[dict[str, Any]]
-    preview: list[dict[str, Any]]
+class ReportScheduleUpdate(APIModel):
+    enabled: bool = False
+    cadence: ReportCadence = ReportCadence.DAILY
+    local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    weekday: int = Field(default=0, ge=0, le=6)
+    day_of_month: int = Field(default=1, ge=1, le=28)
+    destination_path: str = Field(default="", max_length=4096)
+
+    @field_validator("destination_path")
+    @classmethod
+    def normalize_destination(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        return "/" + value.strip().replace("\\", "/").strip("/")
+
+    @model_validator(mode="after")
+    def enabled_schedule_has_destination(self):
+        if self.enabled and not self.destination_path:
+            raise ValueError("Выберите папку Nextcloud для автоматических отчётов")
+        return self

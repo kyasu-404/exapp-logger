@@ -1,61 +1,92 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote
+from xml.etree import ElementTree
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from ..activity_keys import activity_event_key
 from ..db import SessionFactory
-from ..models import (
-    Campaign,
-    CampaignOrganization,
-    CampaignStatus,
-    Dimension,
-    EventType,
-    FileEvent,
-    FileRecord,
-)
-from .classifier import apply_classification, classify, normalize_path, relative_to_campaign
+from ..models import ActivityEvent, EventType, FileRecord, FolderRecord, Watch, WatchStatus
 
 LOGGER = logging.getLogger(__name__)
 
 EVENT_MAP = {
     "NodeCreatedEvent": EventType.CREATED,
-    "NodeWrittenEvent": EventType.WRITTEN,
-    "NodeRenamedEvent": EventType.RENAMED,
+    "NodeWrittenEvent": EventType.UPDATED,
+    "NodeRenamedEvent": EventType.MOVED,
     "NodeDeletedEvent": EventType.DELETED,
     "NodeCopiedEvent": EventType.COPIED,
 }
-
 FULL_EVENT_CLASSES = {name: f"OCP\\Files\\Events\\Node\\{name}" for name in EVENT_MAP}
-
 USER_FILE_RE = re.compile(r"^/?(?P<user>[^/]+)/files/(?P<path>.*)$")
+UPLOAD_TIME_TAG = "{http://nextcloud.org/ns}upload_time"
+_GROUP_CACHE: dict[str, tuple[float, set[str]]] = {}
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def normalize_path(value: str) -> str:
+    normalized = "/" + str(value or "").replace("\\", "/").strip("/")
+    return normalized if normalized != "" else "/"
+
+
+def relative_to_watch(path: str, root_path: str) -> str | None:
+    path = normalize_path(path)
+    root = normalize_path(root_path).rstrip("/")
+    if path == root:
+        return ""
+    prefix = root + "/"
+    return path[len(prefix) :] if path.startswith(prefix) else None
+
+
+def relative_prefix_matches(path: str, prefix: str) -> bool:
+    normalized_path = str(path or "").replace("\\", "/").strip("/").casefold()
+    normalized_prefix = str(prefix or "").replace("\\", "/").strip("/").casefold()
+    return (
+        not normalized_prefix
+        or normalized_path == normalized_prefix
+        or normalized_path.startswith(normalized_prefix + "/")
+    )
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
 def _timestamp(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=UTC)
+        return _aware(value) or utcnow()
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, tz=UTC)
     if isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            return datetime.fromtimestamp(int(raw), tz=UTC)
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return _aware(parsed) or utcnow()
         except ValueError:
             pass
     return utcnow()
+
+
+def _optional_timestamp(value: Any) -> datetime | None:
+    if value in (None, "", 0, "0"):
+        return None
+    return _timestamp(value)
 
 
 @dataclass(slots=True)
@@ -67,6 +98,7 @@ class NodeSnapshot:
     mime_type: str = "application/octet-stream"
     size: int = 0
     mtime: datetime | None = None
+    upload_time: datetime | None = None
     is_dir: bool = False
 
     @property
@@ -74,7 +106,7 @@ class NodeSnapshot:
         return PurePosixPath(self.path).name
 
     @property
-    def directory(self) -> str:
+    def parent_path(self) -> str:
         parent = str(PurePosixPath(self.path).parent)
         return "/" if parent == "." else normalize_path(parent)
 
@@ -93,16 +125,16 @@ class NormalizedEvent:
 def _legacy_node(data: dict[str, Any]) -> NodeSnapshot:
     directory = str(data.get("directory") or "/")
     name = str(data.get("name") or "")
-    path = normalize_path(f"{directory.rstrip('/')}/{name}")
     file_type = str(data.get("fileType") or data.get("file_type") or "file").lower()
     return NodeSnapshot(
         owner_user_id=str(data.get("userId") or data.get("user_id") or ""),
-        path=path,
+        path=normalize_path(f"{directory.rstrip('/')}/{name}"),
         file_id=str(data.get("fileId") or data.get("file_id") or "") or None,
         etag=str(data.get("etag") or "").strip('"'),
         mime_type=str(data.get("mime") or "application/octet-stream"),
         size=int(data.get("size") or 0),
-        mtime=_timestamp(data.get("mtime")) if data.get("mtime") else None,
+        mtime=_optional_timestamp(data.get("mtime")),
+        upload_time=_optional_timestamp(data.get("upload_time") or data.get("uploadTime")),
         is_dir=file_type == "dir",
     )
 
@@ -116,11 +148,7 @@ def _webhook_path_node(data: dict[str, Any], fallback_user: str = "") -> NodeSna
     else:
         owner = fallback_user
         path = normalize_path(raw_path)
-    return NodeSnapshot(
-        owner_user_id=owner,
-        path=path,
-        file_id=str(data.get("id") or "") or None,
-    )
+    return NodeSnapshot(owner_user_id=owner, path=path, file_id=str(data.get("id") or "") or None)
 
 
 async def normalize_event(payload: dict[str, Any]) -> NormalizedEvent:
@@ -132,8 +160,7 @@ async def normalize_event(payload: dict[str, Any]) -> NormalizedEvent:
         target = _legacy_node(event_data.get("target") or {})
         source_data = event_data.get("source")
         source = _legacy_node(source_data) if source_data else None
-        actor = target.owner_user_id
-        return NormalizedEvent(subtype, EVENT_MAP[subtype], target, source, utcnow(), actor, payload)
+        return NormalizedEvent(subtype, EVENT_MAP[subtype], target, source, utcnow(), target.owner_user_id, payload)
 
     envelope = payload.get("event") or {}
     event_class = str(envelope.get("class") or "")
@@ -156,6 +183,25 @@ async def normalize_event(payload: dict[str, Any]) -> NormalizedEvent:
     return event
 
 
+async def _nextcloud_upload_time(nc, owner: str, path: str) -> datetime | None:
+    """Read Nextcloud's nc:upload_time DAV property (not exposed by nc-py-api 0.30)."""
+    try:
+        from nc_py_api.files._files import PropFindType, build_listdir_req, element_tree_as_str
+
+        root, dav_path = build_listdir_req(owner, path.lstrip("/"), ["nc:upload_time"], PropFindType.DEFAULT)
+        response = await nc.files._session.adapter_dav.request(  # noqa: SLF001
+            "PROPFIND", quote(dav_path), data=element_tree_as_str(root), headers={"Depth": "0"}
+        )
+        if response.status_code >= 400:
+            return None
+        document = ElementTree.fromstring(response.content)
+        value = document.findtext(f".//{UPLOAD_TIME_TAG}")
+        return _optional_timestamp(value)
+    except Exception as exc:
+        LOGGER.debug("Не удалось получить nc:upload_time для %s: %s", path, exc)
+        return None
+
+
 async def enrich_snapshot(snapshot: NodeSnapshot) -> NodeSnapshot:
     if not snapshot.owner_user_id:
         return snapshot
@@ -168,14 +214,16 @@ async def enrich_snapshot(snapshot: NodeSnapshot) -> NodeSnapshot:
             node = await nc.files.by_path(snapshot.path.lstrip("/"))
         if node is None:
             return snapshot
+        path = normalize_path(node.user_path)
         return NodeSnapshot(
             owner_user_id=snapshot.owner_user_id,
-            path=normalize_path(node.user_path),
+            path=path,
             file_id=str(node.info.fileid or snapshot.file_id or "") or None,
             etag=node.etag_unquoted,
             mime_type=node.info.mimetype or "application/octet-stream",
             size=int(node.info.content_length or node.info.size or 0),
             mtime=node.info.last_modified,
+            upload_time=await _nextcloud_upload_time(nc, snapshot.owner_user_id, path),
             is_dir=node.is_dir,
         )
     except Exception as exc:
@@ -183,60 +231,94 @@ async def enrich_snapshot(snapshot: NodeSnapshot) -> NodeSnapshot:
         return snapshot
 
 
-async def _active_campaigns(session: AsyncSession, owner_user_id: str) -> list[Campaign]:
-    return list(
-        (
-            await session.scalars(
-                select(Campaign)
-                .where(Campaign.status == CampaignStatus.ACTIVE, Campaign.storage_user_id == owner_user_id)
-                .options(
-                    selectinload(Campaign.organizations).selectinload(CampaignOrganization.organization),
-                    selectinload(Campaign.dimensions).selectinload(Dimension.values),
-                )
-            )
-        ).all()
-    )
+def _watch_accepts_event(watch: Watch, event_time: datetime) -> bool:
+    moment = _aware(event_time)
+    started = _aware(watch.started_at)
+    ended = _aware(watch.ended_at)
+    return not ((started and moment < started) or (ended and moment > ended))
 
 
-def _event_key(campaign_id: int, event: NormalizedEvent, snapshot: NodeSnapshot, old_path: str = "") -> str:
-    identity = {
-        "campaign": campaign_id,
-        "type": event.event_type.value,
-        "file_id": snapshot.file_id,
-        "etag": snapshot.etag,
-        "path": snapshot.path,
-        "old_path": old_path,
-    }
-    return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+async def _active_watches(session: AsyncSession) -> list[Watch]:
+    return list((await session.scalars(select(Watch).where(Watch.status == WatchStatus.ACTIVE))).all())
 
 
-async def _find_file(session: AsyncSession, campaign_id: int, snapshot: NodeSnapshot) -> FileRecord | None:
+async def _event_user_groups(user_id: str) -> set[str]:
+    if not user_id:
+        return set()
+    cached = _GROUP_CACHE.get(user_id)
+    now = time.monotonic()
+    if cached and now - cached[0] < 300:
+        return cached[1]
+    try:
+        from nc_py_api import AsyncNextcloudApp
+
+        info = await AsyncNextcloudApp(user=user_id).users.get_user()
+        groups = set(info.groups)
+    except Exception as exc:
+        LOGGER.warning("Не удалось определить группы автора события %s: %s", user_id, exc)
+        groups = set()
+    _GROUP_CACHE[user_id] = (now, groups)
+    return groups
+
+
+def _scope_accepts_owner(watch: Watch, node_owner: str, actor_groups: set[str]) -> bool:
+    if watch.scope_type != "team":
+        return watch.owner_user_id == node_owner
+    return node_owner == watch.owner_user_id or bool(set(watch.group_ids or []).intersection(actor_groups))
+
+
+async def _find_file(session: AsyncSession, watch_id: int, snapshot: NodeSnapshot) -> FileRecord | None:
     predicates = [FileRecord.full_path == snapshot.path]
     if snapshot.file_id:
         predicates.insert(0, FileRecord.nextcloud_file_id == snapshot.file_id)
     return await session.scalar(
-        select(FileRecord).where(FileRecord.campaign_id == campaign_id, or_(*predicates)).order_by(FileRecord.id.desc())
+        select(FileRecord).where(FileRecord.watch_id == watch_id, or_(*predicates)).order_by(FileRecord.id.desc())
     )
 
 
-async def _record_event(
+async def _find_folder(session: AsyncSession, watch_id: int, snapshot: NodeSnapshot) -> FolderRecord | None:
+    predicates = [FolderRecord.full_path == snapshot.path]
+    if snapshot.file_id:
+        predicates.insert(0, FolderRecord.nextcloud_file_id == snapshot.file_id)
+    return await session.scalar(
+        select(FolderRecord).where(FolderRecord.watch_id == watch_id, or_(*predicates)).order_by(FolderRecord.id.desc())
+    )
+
+
+async def _record_activity(
     session: AsyncSession,
-    file: FileRecord,
+    watch: Watch,
+    file: FileRecord | None,
     event: NormalizedEvent,
+    event_type: EventType,
     snapshot: NodeSnapshot,
     old_path: str = "",
+    node_type: str = "file",
 ) -> bool:
-    key = _event_key(file.campaign_id, event, snapshot, old_path)
-    if await session.scalar(select(FileEvent.id).where(FileEvent.event_key == key)):
+    node_identity = snapshot.file_id or (file.nextcloud_file_id if file else None)
+    if event_type == EventType.UPDATED:
+        node_identity = f"{node_identity or (file.id if file else snapshot.path)}:{snapshot.etag or snapshot.mtime}"
+    key = activity_event_key(
+        watch.id,
+        event_type,
+        node_identity,
+        snapshot.path,
+        old_path,
+        event.occurred_at,
+    )
+    if await session.scalar(select(ActivityEvent.id).where(ActivityEvent.event_key == key)):
         return False
     session.add(
-        FileEvent(
-            file_id=file.id,
+        ActivityEvent(
+            watch_id=watch.id,
+            file_id=file.id if file else None,
             event_key=key,
-            event_type=event.event_type,
-            occurred_at=event.occurred_at,
+            event_type=event_type,
+            node_type=node_type,
+            event_time=event.occurred_at,
+            path=snapshot.path,
             old_path=old_path,
-            new_path=snapshot.path,
+            new_path=snapshot.path if event_type != EventType.DELETED else "",
             etag=snapshot.etag,
             size=snapshot.size,
             actor_user_id=event.actor_user_id,
@@ -246,139 +328,243 @@ async def _record_event(
     return True
 
 
+def _file_parts(watch: Watch, snapshot: NodeSnapshot) -> tuple[str, str, str]:
+    relative = relative_to_watch(snapshot.path, watch.root_path)
+    if relative is None:
+        raise ValueError("Путь находится вне наблюдения")
+    parent = str(PurePosixPath(relative).parent)
+    if parent == ".":
+        parent = ""
+    extension = PurePosixPath(snapshot.filename).suffix.lower().lstrip(".")
+    return relative, parent, extension
+
+
 async def _upsert_file(
     session: AsyncSession,
-    campaign: Campaign,
+    watch: Watch,
     event: NormalizedEvent,
+    event_type: EventType,
     snapshot: NodeSnapshot,
     old_path: str = "",
 ) -> bool:
     if snapshot.is_dir:
-        return False
-    file = await _find_file(session, campaign.id, snapshot)
+        return await _upsert_folder(session, watch, event, event_type, snapshot, old_path)
+    relative, parent, extension = _file_parts(watch, snapshot)
+    file = await _find_file(session, watch.id, snapshot)
     is_new = file is None
     if file is None:
         file = FileRecord(
-            campaign_id=campaign.id,
+            watch_id=watch.id,
             nextcloud_file_id=snapshot.file_id,
-            owner_user_id=snapshot.owner_user_id,
             filename=snapshot.filename,
-            directory=snapshot.directory,
-            relative_path="",
             full_path=snapshot.path,
+            relative_path=relative,
+            parent_path=parent,
             mime_type=snapshot.mime_type,
+            extension=extension,
             size=snapshot.size,
             etag=snapshot.etag,
-            first_received_at=event.occurred_at,
-            last_received_at=event.occurred_at,
-            node_mtime=snapshot.mtime,
-            event_received_at=utcnow(),
-            revision_count=0,
+            first_seen_at=event.occurred_at,
+            last_seen_at=event.occurred_at,
+            nextcloud_upload_time=snapshot.upload_time,
+            nextcloud_mtime=snapshot.mtime,
             discovered_by="event",
         )
         session.add(file)
         await session.flush()
-    if not await _record_event(session, file, event, snapshot, old_path):
+    old_etag = file.etag
+    old_size = file.size
+    old_mtime = file.nextcloud_mtime
+    if event_type == EventType.UPDATED:
+        changed = is_new or any(
+            (
+                bool(snapshot.etag and snapshot.etag != old_etag),
+                snapshot.size != old_size,
+                bool(snapshot.mtime and snapshot.mtime != old_mtime),
+            )
+        )
+        if not changed:
+            return False
+        await _record_activity(session, watch, file, event, event_type, snapshot, old_path)
+    elif not await _record_activity(session, watch, file, event, event_type, snapshot, old_path):
         return False
 
-    previous_etag = file.etag
     file.nextcloud_file_id = snapshot.file_id or file.nextcloud_file_id
-    file.owner_user_id = snapshot.owner_user_id or file.owner_user_id
     file.filename = snapshot.filename
-    file.directory = snapshot.directory
     file.full_path = snapshot.path
+    file.relative_path = relative
+    file.parent_path = parent
     file.mime_type = snapshot.mime_type or file.mime_type
+    file.extension = extension
     file.size = snapshot.size
     file.etag = snapshot.etag or file.etag
-    file.node_mtime = snapshot.mtime or file.node_mtime
-    file.event_received_at = utcnow()
-    file.deleted = False
+    file.nextcloud_upload_time = snapshot.upload_time or file.nextcloud_upload_time
+    file.nextcloud_mtime = snapshot.mtime or file.nextcloud_mtime
+    file.last_seen_at = event.occurred_at
+    file.exists = True
     file.deleted_at = None
-    if event.event_type == EventType.WRITTEN and not is_new and (not snapshot.etag or snapshot.etag != previous_etag):
+    if event_type == EventType.UPDATED and not is_new:
         file.revision_count += 1
-        file.last_received_at = event.occurred_at
-    elif event.event_type in {EventType.CREATED, EventType.COPIED} and not is_new:
-        file.last_received_at = event.occurred_at
-    await apply_classification(session, file, classify(campaign, snapshot.path))
     return True
 
 
-async def _mark_deleted_or_moved(
+async def _upsert_folder(
     session: AsyncSession,
-    campaign: Campaign,
+    watch: Watch,
     event: NormalizedEvent,
+    event_type: EventType,
+    snapshot: NodeSnapshot,
+    old_path: str = "",
+) -> bool:
+    relative = relative_to_watch(snapshot.path, watch.root_path)
+    if relative is None or relative == "":
+        return False
+    folder = await _find_folder(session, watch.id, snapshot)
+    if not await _record_activity(session, watch, None, event, event_type, snapshot, old_path, node_type="folder"):
+        return False
+    if folder is None:
+        folder = FolderRecord(
+            watch_id=watch.id,
+            nextcloud_file_id=snapshot.file_id,
+            name=snapshot.filename,
+            full_path=snapshot.path,
+            relative_path=relative,
+            first_seen_at=event.occurred_at,
+            last_seen_at=event.occurred_at,
+        )
+        session.add(folder)
+    else:
+        folder.nextcloud_file_id = snapshot.file_id or folder.nextcloud_file_id
+        folder.name = snapshot.filename
+        folder.full_path = snapshot.path
+        folder.relative_path = relative
+        folder.last_seen_at = event.occurred_at
+        folder.exists = True
+        folder.deleted_at = None
+    return True
+
+
+async def _mark_missing(
+    session: AsyncSession,
+    watch: Watch,
+    event: NormalizedEvent,
+    event_type: EventType,
     snapshot: NodeSnapshot,
     new_path: str = "",
-) -> int:
-    path = normalize_path(snapshot.path)
-    predicates = [FileRecord.full_path == path, FileRecord.full_path.like(path.rstrip("/") + "/%")]
-    if snapshot.file_id:
-        predicates.insert(0, FileRecord.nextcloud_file_id == snapshot.file_id)
-    files = list(
-        (
-            await session.scalars(
-                select(FileRecord).where(
-                    FileRecord.campaign_id == campaign.id,
-                    FileRecord.deleted.is_(False),
-                    or_(*predicates),
-                )
-            )
-        ).all()
+) -> bool:
+    if snapshot.is_dir:
+        return await _mark_folder_missing(session, watch, event, event_type, snapshot, new_path)
+    file = await _find_file(session, watch.id, snapshot)
+    if file is None:
+        return await _mark_folder_missing(session, watch, event, event_type, snapshot, new_path)
+    target = NodeSnapshot(
+        owner_user_id=snapshot.owner_user_id,
+        path=new_path or snapshot.path,
+        file_id=snapshot.file_id,
+        etag=file.etag,
+        mime_type=file.mime_type,
+        size=file.size,
+        mtime=file.nextcloud_mtime,
+        upload_time=file.nextcloud_upload_time,
     )
-    changed = 0
-    for file in files:
-        event_snapshot = NodeSnapshot(
-            owner_user_id=file.owner_user_id,
-            path=new_path or file.full_path,
-            file_id=file.nextcloud_file_id,
-            etag=file.etag,
-            mime_type=file.mime_type,
-            size=file.size,
-            mtime=file.node_mtime,
-        )
-        if not await _record_event(session, file, event, event_snapshot, old_path=file.full_path):
-            continue
-        file.deleted = True
-        file.deleted_at = event.occurred_at
-        file.event_received_at = utcnow()
-        changed += 1
-    return changed
+    if not await _record_activity(session, watch, file, event, event_type, target, snapshot.path):
+        return False
+    file.exists = False
+    file.deleted_at = event.occurred_at
+    file.last_seen_at = event.occurred_at
+    return True
+
+
+async def _mark_folder_missing(
+    session: AsyncSession,
+    watch: Watch,
+    event: NormalizedEvent,
+    event_type: EventType,
+    snapshot: NodeSnapshot,
+    new_path: str = "",
+) -> bool:
+    folder = await _find_folder(session, watch.id, snapshot)
+    if folder is None:
+        return False
+    target = NodeSnapshot(
+        owner_user_id=snapshot.owner_user_id,
+        path=new_path or snapshot.path,
+        file_id=snapshot.file_id or folder.nextcloud_file_id,
+        is_dir=True,
+    )
+    if not await _record_activity(session, watch, None, event, event_type, target, snapshot.path, node_type="folder"):
+        return False
+    folder.exists = False
+    folder.deleted_at = event.occurred_at
+    folder.last_seen_at = event.occurred_at
+    return True
+
+
+def _rename_type(source: NodeSnapshot, target: NodeSnapshot) -> EventType:
+    return EventType.MOVED if source.parent_path != target.parent_path else EventType.RENAMED
 
 
 async def process_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     event = await normalize_event(payload)
-    if not event.target.owner_user_id:
-        raise ValueError("В событии не удалось определить владельца файла")
-    changed = 0
-    async with SessionFactory() as session:
-        target_campaigns = await _active_campaigns(session, event.target.owner_user_id)
-        target_matches = [
-            campaign
-            for campaign in target_campaigns
-            if relative_to_campaign(event.target.path, campaign.root_path) is not None
-        ]
+    owners = {node.owner_user_id for node in (event.target, event.source) if node and node.owner_user_id}
+    if not owners:
+        return {"matched": 0, "changed": 0}
 
-        if event.event_type == EventType.DELETED:
-            for campaign in target_matches:
-                changed += await _mark_deleted_or_moved(session, campaign, event, event.target)
-        elif event.event_type == EventType.RENAMED and event.source:
-            source_campaigns = await _active_campaigns(session, event.source.owner_user_id)
-            source_matches = [
-                campaign
-                for campaign in source_campaigns
-                if relative_to_campaign(event.source.path, campaign.root_path) is not None
-            ]
-            target_ids = {campaign.id for campaign in target_matches}
-            for campaign in source_matches:
-                if campaign.id not in target_ids:
-                    changed += await _mark_deleted_or_moved(
-                        session, campaign, event, event.source, new_path=event.target.path
+    matched = changed = 0
+    async with SessionFactory() as session:
+        watches = await _active_watches(session)
+        actor_groups = (
+            await _event_user_groups(event.actor_user_id or event.target.owner_user_id)
+            if any(watch.scope_type == "team" for watch in watches)
+            else set()
+        )
+        for watch in watches:
+            if not _watch_accepts_event(watch, event.occurred_at):
+                continue
+            target_inside = (
+                _scope_accepts_owner(watch, event.target.owner_user_id, actor_groups)
+                and relative_to_watch(event.target.path, watch.root_path) is not None
+            )
+            source_inside = bool(
+                event.source
+                and _scope_accepts_owner(watch, event.source.owner_user_id, actor_groups)
+                and relative_to_watch(event.source.path, watch.root_path) is not None
+            )
+            if not target_inside and not source_inside:
+                continue
+            matched += 1
+            watch.last_webhook_at = utcnow()
+
+            did_change = False
+            if event.subtype == "NodeDeletedEvent" and target_inside:
+                did_change = await _mark_missing(session, watch, event, EventType.DELETED, event.target)
+            elif event.subtype == "NodeRenamedEvent":
+                source = event.source or event.target
+                move_type = _rename_type(source, event.target)
+                if source_inside and target_inside:
+                    did_change = await _upsert_file(
+                        session, watch, event, move_type, event.target, old_path=source.path
                     )
-            for campaign in target_matches:
-                changed += int(await _upsert_file(session, campaign, event, event.target, event.source.path))
-        else:
-            for campaign in target_matches:
-                changed += int(await _upsert_file(session, campaign, event, event.target))
+                elif source_inside:
+                    did_change = await _mark_missing(
+                        session, watch, event, EventType.MOVED, source, new_path=event.target.path
+                    )
+                elif target_inside:
+                    did_change = await _upsert_file(
+                        session, watch, event, EventType.MOVED, event.target, old_path=source.path
+                    )
+            elif event.subtype == "NodeCopiedEvent" and target_inside:
+                did_change = await _upsert_file(
+                    session,
+                    watch,
+                    event,
+                    EventType.COPIED,
+                    event.target,
+                    old_path=event.source.path if event.source else "",
+                )
+            elif target_inside:
+                did_change = await _upsert_file(session, watch, event, event.event_type, event.target)
+
+            changed += int(did_change)
         await session.commit()
-    LOGGER.info("Обработано событие %s, изменено записей: %d", event.subtype, changed)
-    return {"accepted": True, "event": event.subtype, "changed": changed}
+    return {"matched": matched, "changed": changed}

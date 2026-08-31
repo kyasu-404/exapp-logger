@@ -8,10 +8,11 @@ RUN pnpm build
 
 FROM python:3.12-alpine3.21
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Europe/Moscow
 WORKDIR /app
 
-RUN apk add --no-cache bash curl frp libpq \
+RUN apk add --no-cache bash curl frp libpq tzdata \
     && apk add --no-cache --virtual .build-deps build-base postgresql-dev
 
 COPY pyproject.toml README.md ./

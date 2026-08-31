@@ -1,31 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 from collections import defaultdict
+from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
+from urllib.parse import quote
+from xml.etree import ElementTree
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from ..activity_keys import activity_event_key
 from ..db import SessionFactory
-from ..models import (
-    Campaign,
-    CampaignOrganization,
-    CampaignStatus,
-    Dimension,
-    EventType,
-    FileEvent,
-    FileRecord,
-    ReconciliationRun,
-)
-from .classifier import apply_classification, classify, normalize_path
-from .events import NodeSnapshot
+from ..models import ActivityEvent, EventType, FileRecord, FolderRecord, ReconciliationRun, Watch, WatchStatus
+from .events import NodeSnapshot, _optional_timestamp, normalize_path, relative_to_watch
 
 LOGGER = logging.getLogger(__name__)
+UPLOAD_TIME_TAG = "{http://nextcloud.org/ns}upload_time"
+FILE_ID_TAG = "{http://owncloud.org/ns}fileid"
 _LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
@@ -33,166 +26,394 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _key(campaign_id: int, event_type: EventType, file_identity: str, etag: str, path: str) -> str:
-    raw = json.dumps(
-        {"campaign": campaign_id, "type": event_type.value, "file": file_identity, "etag": etag, "path": path},
-        sort_keys=True,
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _same_timestamp(left: datetime | None, right: datetime | None) -> bool:
+    return _aware(left) == _aware(right)
+
+
+def refresh_file_metadata(
+    file: FileRecord,
+    snapshot: NodeSnapshot,
+    relative: str,
+    parent: str,
+    extension: str,
+) -> tuple[bool, bool, bool, bool]:
+    """Apply the authoritative DAV snapshot and describe what changed."""
+    path_changed = file.full_path != snapshot.path
+    content_changed = file.etag != snapshot.etag or file.size != snapshot.size
+    restored = not file.exists
+    upload_time = snapshot.upload_time or file.nextcloud_upload_time
+    mtime = snapshot.mtime or file.nextcloud_mtime
+    metadata_changed = any(
+        (
+            file.nextcloud_file_id != (snapshot.file_id or file.nextcloud_file_id),
+            file.filename != snapshot.filename,
+            file.relative_path != relative,
+            file.parent_path != parent,
+            file.mime_type != snapshot.mime_type,
+            file.extension != extension,
+            not _same_timestamp(file.nextcloud_upload_time, upload_time),
+            not _same_timestamp(file.nextcloud_mtime, mtime),
+        )
     )
-    return hashlib.sha256(raw.encode()).hexdigest()
+
+    file.nextcloud_file_id = snapshot.file_id or file.nextcloud_file_id
+    file.filename = snapshot.filename
+    file.full_path = snapshot.path
+    file.relative_path = relative
+    file.parent_path = parent
+    file.mime_type = snapshot.mime_type
+    file.extension = extension
+    file.size = snapshot.size
+    file.etag = snapshot.etag
+    file.nextcloud_upload_time = upload_time
+    file.nextcloud_mtime = mtime
+    file.exists = True
+    file.deleted_at = None
+    return path_changed, content_changed, restored, metadata_changed
 
 
-def snapshot_from_fs_node(owner: str, node) -> NodeSnapshot:
+async def _tree_snapshots(nc, owner: str, root_path: str) -> list[NodeSnapshot]:
+    """Read the complete DAV tree and upload times in one request."""
+    try:
+        from nc_py_api.files._files import (
+            PropFindType,
+            build_listdir_req,
+            build_listdir_response,
+            element_tree_as_str,
+            get_propfind_properties,
+        )
+
+        properties = get_propfind_properties(await nc.files._session.capabilities)  # noqa: SLF001
+        properties.append("nc:upload_time")
+        relative_root = root_path.lstrip("/")
+        root, dav_path = build_listdir_req(owner, relative_root, properties, PropFindType.DEFAULT)
+        response = await nc.files._session.adapter_dav.request(  # noqa: SLF001
+            "PROPFIND", quote(dav_path), data=element_tree_as_str(root), headers={"Depth": "infinity"}
+        )
+        upload_times: dict[str, datetime] = {}
+        document = ElementTree.fromstring(response.content)
+        for response_node in document.findall(".//{DAV:}response"):
+            file_id = response_node.findtext(f".//{FILE_ID_TAG}")
+            upload_time = _optional_timestamp(response_node.findtext(f".//{UPLOAD_TIME_TAG}"))
+            if file_id and upload_time:
+                upload_times[str(file_id)] = upload_time
+        nodes = build_listdir_response(
+            nc.files._session.cfg.dav_url_suffix,  # noqa: SLF001
+            response,
+            owner,
+            relative_root,
+            properties,
+            True,
+            PropFindType.DEFAULT,
+        )
+        return [snapshot_from_fs_node(owner, node, upload_times) for node in nodes]
+    except Exception as exc:
+        LOGGER.warning("Не удалось получить дерево DAV для %s: %s", root_path, exc)
+        raise
+
+
+def snapshot_from_fs_node(owner: str, node, upload_times: dict[str, datetime] | None = None) -> NodeSnapshot:
+    file_id = str(node.info.fileid or "") or None
     return NodeSnapshot(
         owner_user_id=owner,
         path=normalize_path(node.user_path),
-        file_id=str(node.info.fileid or "") or None,
+        file_id=file_id,
         etag=node.etag_unquoted,
         mime_type=node.info.mimetype or "application/octet-stream",
         size=int(node.info.content_length or node.info.size or 0),
         mtime=node.info.last_modified,
+        upload_time=(upload_times or {}).get(file_id or ""),
         is_dir=node.is_dir,
     )
 
 
-async def _campaign(session: AsyncSession, campaign_id: int) -> Campaign | None:
-    return await session.scalar(
-        select(Campaign)
-        .where(Campaign.id == campaign_id)
-        .options(
-            selectinload(Campaign.organizations).selectinload(CampaignOrganization.organization),
-            selectinload(Campaign.dimensions).selectinload(Dimension.values),
-        )
-    )
+def _parts(watch: Watch, snapshot: NodeSnapshot) -> tuple[str, str, str]:
+    relative = relative_to_watch(snapshot.path, watch.root_path)
+    if relative is None:
+        raise ValueError("Файл находится вне наблюдаемой папки")
+    parent = str(PurePosixPath(relative).parent)
+    if parent == ".":
+        parent = ""
+    extension = PurePosixPath(snapshot.filename).suffix.lower().lstrip(".")
+    return relative, parent, extension
 
 
 async def _event(
-    session: AsyncSession,
-    file: FileRecord,
+    session,
+    file: FileRecord | None,
     event_type: EventType,
     path: str,
     actor: str,
+    *,
+    old_path: str = "",
+    event_time: datetime | None = None,
+    watch_id: int | None = None,
+    node_identity: str = "",
+    node_type: str = "file",
+    size: int = 0,
+    etag: str = "",
 ) -> None:
-    key = _key(file.campaign_id, event_type, file.nextcloud_file_id or str(file.id), file.etag, path)
-    if await session.scalar(select(FileEvent.id).where(FileEvent.event_key == key)):
+    occurred_at = event_time or utcnow()
+    resolved_watch_id = file.watch_id if file else watch_id
+    if resolved_watch_id is None:
+        raise ValueError("Не указан идентификатор наблюдения")
+    identity = node_identity or (file.nextcloud_file_id if file else "") or (str(file.id) if file else path)
+    resolved_etag = etag or (file.etag if file else "")
+    if event_type == EventType.UPDATED:
+        identity = f"{identity}:{resolved_etag or occurred_at.isoformat()}"
+    key = activity_event_key(
+        resolved_watch_id,
+        event_type,
+        identity,
+        path,
+        old_path,
+        occurred_at,
+    )
+    if await session.scalar(select(ActivityEvent.id).where(ActivityEvent.event_key == key)):
         return
     session.add(
-        FileEvent(
-            file_id=file.id,
+        ActivityEvent(
+            watch_id=resolved_watch_id,
+            file_id=file.id if file else None,
             event_key=key,
             event_type=event_type,
-            occurred_at=utcnow(),
-            old_path=file.full_path if event_type == EventType.RECONCILED_MISSING else "",
-            new_path=path,
-            etag=file.etag,
-            size=file.size,
+            node_type=node_type,
+            event_time=occurred_at,
+            path=path,
+            old_path=old_path,
+            new_path=path if event_type != EventType.DELETED else "",
+            etag=resolved_etag,
+            size=file.size if file else size,
             actor_user_id=actor,
             raw_event={"source": "reconciliation"},
         )
     )
 
 
-async def reconcile_campaign(campaign_id: int, triggered_by: str = "system") -> dict[str, int | str]:
-    async with _LOCKS[campaign_id]:
+def watch_is_current(watch: Watch, moment: datetime | None = None) -> bool:
+    now = _aware(moment or utcnow())
+    started = _aware(watch.started_at)
+    ended = _aware(watch.ended_at)
+    return bool(
+        watch.status == WatchStatus.ACTIVE and (started is None or started <= now) and (ended is None or now <= ended)
+    )
+
+
+async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[str, int | str]:
+    async with _LOCKS[watch_id]:
         async with SessionFactory() as session:
-            campaign = await _campaign(session, campaign_id)
-            if campaign is None:
-                raise ValueError("Кампания не найдена")
-            run = ReconciliationRun(campaign_id=campaign.id, triggered_by=triggered_by)
+            watch = await session.get(Watch, watch_id)
+            if watch is None:
+                raise ValueError("Наблюдение не найдено")
+            if not watch_is_current(watch):
+                return {
+                    "status": "skipped",
+                    "reason": "Наблюдение не активно или текущая дата вне его периода",
+                    "checked": 0,
+                    "created": 0,
+                    "updated": 0,
+                    "missing": 0,
+                }
+            run = ReconciliationRun(watch_id=watch.id, triggered_by=triggered_by)
             session.add(run)
             await session.commit()
-            await session.refresh(run)
+            run_id = run.id
 
         try:
             from nc_py_api import AsyncNextcloudApp
 
-            nc = AsyncNextcloudApp(user=campaign.storage_user_id)
-            nodes = await nc.files.listdir(campaign.root_path.lstrip("/"), depth=-1)
-            snapshots = [snapshot_from_fs_node(campaign.storage_user_id, node) for node in nodes if not node.is_dir]
+            nc = AsyncNextcloudApp(user=watch.owner_user_id)
+            snapshots = await _tree_snapshots(nc, watch.owner_user_id, watch.root_path)
+            file_snapshots = [snapshot for snapshot in snapshots if not snapshot.is_dir]
+            folder_snapshots = [snapshot for snapshot in snapshots if snapshot.is_dir]
             checked = len(snapshots)
             created = updated = missing = 0
             now = utcnow()
+
             async with SessionFactory() as session:
-                campaign = await _campaign(session, campaign_id)
+                watch = await session.get(Watch, watch_id)
+                if watch is None:
+                    raise ValueError("Наблюдение не найдено")
                 existing = list(
-                    (await session.scalars(select(FileRecord).where(FileRecord.campaign_id == campaign_id))).all()
+                    (await session.scalars(select(FileRecord).where(FileRecord.watch_id == watch_id))).all()
+                )
+                existing_folders = list(
+                    (await session.scalars(select(FolderRecord).where(FolderRecord.watch_id == watch_id))).all()
                 )
                 by_id = {file.nextcloud_file_id: file for file in existing if file.nextcloud_file_id}
                 by_path = {file.full_path: file for file in existing}
                 seen_ids: set[int] = set()
 
-                for snapshot in snapshots:
+                folders_by_id = {
+                    folder.nextcloud_file_id: folder for folder in existing_folders if folder.nextcloud_file_id
+                }
+                folders_by_path = {folder.full_path: folder for folder in existing_folders}
+                seen_folder_ids: set[int] = set()
+
+                for snapshot in folder_snapshots:
+                    relative = relative_to_watch(snapshot.path, watch.root_path)
+                    if relative in (None, ""):
+                        continue
+                    folder = folders_by_id.get(snapshot.file_id) if snapshot.file_id else None
+                    folder = folder or folders_by_path.get(snapshot.path)
+                    if folder is None:
+                        folder = FolderRecord(
+                            watch_id=watch_id,
+                            nextcloud_file_id=snapshot.file_id,
+                            name=snapshot.filename,
+                            full_path=snapshot.path,
+                            relative_path=relative,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                        )
+                        session.add(folder)
+                        await session.flush()
+                        await _event(
+                            session,
+                            None,
+                            EventType.CREATED,
+                            snapshot.path,
+                            triggered_by,
+                            watch_id=watch_id,
+                            node_identity=snapshot.file_id or str(folder.id),
+                            node_type="folder",
+                        )
+                        created += 1
+                    else:
+                        old_path = folder.full_path
+                        path_changed = old_path != snapshot.path
+                        restored = not folder.exists
+                        folder.nextcloud_file_id = snapshot.file_id or folder.nextcloud_file_id
+                        folder.name = snapshot.filename
+                        folder.full_path = snapshot.path
+                        folder.relative_path = relative
+                        folder.exists = True
+                        folder.deleted_at = None
+                        if path_changed or restored:
+                            folder.last_seen_at = now
+                            await _event(
+                                session,
+                                None,
+                                EventType.MOVED if path_changed else EventType.CREATED,
+                                snapshot.path,
+                                triggered_by,
+                                old_path=old_path if path_changed else "",
+                                watch_id=watch_id,
+                                node_identity=snapshot.file_id or str(folder.id),
+                                node_type="folder",
+                            )
+                            updated += 1
+                    seen_folder_ids.add(folder.id)
+
+                for snapshot in file_snapshots:
                     file = by_id.get(snapshot.file_id) if snapshot.file_id else None
                     file = file or by_path.get(snapshot.path)
+                    relative, parent, extension = _parts(watch, snapshot)
                     if file is None:
                         file = FileRecord(
-                            campaign_id=campaign_id,
+                            watch_id=watch_id,
                             nextcloud_file_id=snapshot.file_id,
-                            owner_user_id=snapshot.owner_user_id,
                             filename=snapshot.filename,
-                            directory=snapshot.directory,
-                            relative_path="",
                             full_path=snapshot.path,
+                            relative_path=relative,
+                            parent_path=parent,
                             mime_type=snapshot.mime_type,
+                            extension=extension,
                             size=snapshot.size,
                             etag=snapshot.etag,
-                            first_received_at=now,
-                            last_received_at=now,
-                            node_mtime=snapshot.mtime,
-                            event_received_at=now,
+                            first_seen_at=now,
+                            last_seen_at=now,
+                            nextcloud_upload_time=snapshot.upload_time,
+                            nextcloud_mtime=snapshot.mtime,
                             discovered_by="reconciliation",
                         )
                         session.add(file)
                         await session.flush()
-                        await apply_classification(session, file, classify(campaign, snapshot.path))
-                        await _event(session, file, EventType.RECONCILED_CREATED, snapshot.path, triggered_by)
+                        await _event(session, file, EventType.CREATED, snapshot.path, triggered_by, event_time=now)
                         created += 1
                     else:
-                        was_changed = (
-                            file.etag != snapshot.etag
-                            or file.size != snapshot.size
-                            or file.full_path != snapshot.path
-                            or file.deleted
+                        old_path = file.full_path
+                        path_changed, content_changed, restored, metadata_changed = refresh_file_metadata(
+                            file, snapshot, relative, parent, extension
                         )
-                        if was_changed:
-                            if file.etag and snapshot.etag and file.etag != snapshot.etag:
+                        if path_changed or content_changed or restored or metadata_changed:
+                            if content_changed and file.etag:
                                 file.revision_count += 1
-                                file.last_received_at = now
-                            file.nextcloud_file_id = snapshot.file_id or file.nextcloud_file_id
-                            file.filename = snapshot.filename
-                            file.directory = snapshot.directory
-                            file.full_path = snapshot.path
-                            file.mime_type = snapshot.mime_type
-                            file.size = snapshot.size
-                            file.etag = snapshot.etag
-                            file.node_mtime = snapshot.mtime
-                            file.event_received_at = now
-                            file.deleted = False
-                            file.deleted_at = None
-                            await apply_classification(session, file, classify(campaign, snapshot.path))
-                            await _event(session, file, EventType.RECONCILED_UPDATED, snapshot.path, triggered_by)
+                            if path_changed or content_changed or restored:
+                                file.last_seen_at = now
+                            if path_changed or content_changed or restored:
+                                event_type = (
+                                    EventType.MOVED
+                                    if path_changed
+                                    else EventType.CREATED
+                                    if restored
+                                    else EventType.UPDATED
+                                )
+                                await _event(
+                                    session,
+                                    file,
+                                    event_type,
+                                    snapshot.path,
+                                    triggered_by,
+                                    old_path=old_path if path_changed else "",
+                                )
                             updated += 1
                     seen_ids.add(file.id)
 
                 for file in existing:
-                    if file.id in seen_ids or file.deleted:
+                    if file.id in seen_ids or not file.exists:
                         continue
-                    file.deleted = True
+                    file.exists = False
                     file.deleted_at = now
-                    file.event_received_at = now
-                    await _event(session, file, EventType.RECONCILED_MISSING, file.full_path, triggered_by)
+                    file.last_seen_at = now
+                    await _event(
+                        session,
+                        file,
+                        EventType.DELETED,
+                        file.full_path,
+                        triggered_by,
+                        old_path=file.full_path,
+                    )
                     missing += 1
 
-                run = await session.get(ReconciliationRun, run.id)
-                run.status = "completed"
-                run.finished_at = utcnow()
-                run.checked_count = checked
-                run.created_count = created
-                run.updated_count = updated
-                run.missing_count = missing
+                for folder in existing_folders:
+                    if folder.id in seen_folder_ids or not folder.exists:
+                        continue
+                    folder.exists = False
+                    folder.deleted_at = now
+                    folder.last_seen_at = now
+                    await _event(
+                        session,
+                        None,
+                        EventType.DELETED,
+                        folder.full_path,
+                        triggered_by,
+                        old_path=folder.full_path,
+                        watch_id=watch_id,
+                        node_identity=folder.nextcloud_file_id or str(folder.id),
+                        node_type="folder",
+                    )
+                    missing += 1
+
+                completed_run = await session.get(ReconciliationRun, run_id)
+                if completed_run:
+                    completed_run.status = "completed"
+                    completed_run.finished_at = utcnow()
+                    completed_run.checked_count = checked
+                    completed_run.created_count = created
+                    completed_run.updated_count = updated
+                    completed_run.missing_count = missing
                 await session.commit()
+
             LOGGER.info(
-                "Сверка кампании %s завершена: проверено=%d новых=%d обновлено=%d отсутствует=%d",
-                campaign_id,
+                "Сверка наблюдения %s: проверено=%d новых=%d обновлено=%d отсутствует=%d",
+                watch_id,
                 checked,
                 created,
                 updated,
@@ -206,9 +427,9 @@ async def reconcile_campaign(campaign_id: int, triggered_by: str = "system") -> 
                 "missing": missing,
             }
         except Exception as exc:
-            LOGGER.exception("Ошибка сверки кампании %s", campaign_id)
+            LOGGER.exception("Ошибка сверки наблюдения %s", watch_id)
             async with SessionFactory() as session:
-                failed_run = await session.get(ReconciliationRun, run.id)
+                failed_run = await session.get(ReconciliationRun, run_id)
                 if failed_run:
                     failed_run.status = "failed"
                     failed_run.finished_at = utcnow()
@@ -219,9 +440,15 @@ async def reconcile_campaign(campaign_id: int, triggered_by: str = "system") -> 
 
 async def reconcile_all_active() -> None:
     async with SessionFactory() as session:
-        ids = list((await session.scalars(select(Campaign.id).where(Campaign.status == CampaignStatus.ACTIVE))).all())
-    for campaign_id in ids:
-        try:
-            await reconcile_campaign(campaign_id)
-        except Exception:
-            continue
+        now = utcnow()
+        watches = list((await session.scalars(select(Watch).where(Watch.status == WatchStatus.ACTIVE))).all())
+        ids = [watch.id for watch in watches if watch_is_current(watch, now)]
+
+    semaphore = asyncio.Semaphore(3)
+
+    async def run_one(watch_id: int) -> None:
+        async with semaphore:
+            with suppress(Exception):
+                await reconcile_watch(watch_id)
+
+    await asyncio.gather(*(run_one(watch_id) for watch_id in ids))

@@ -13,7 +13,9 @@ from .config import get_settings, in_nextcloud_runtime
 from .db import close_database, init_database
 from .integrations import enabled_handler
 from .routers import ALL_ROUTERS
+from .services.folder_scope import synchronize_active_watch_scopes
 from .services.reconciliation import reconcile_all_active
+from .services.scheduled_reports import run_due_reports
 
 settings = get_settings()
 logging.basicConfig(
@@ -27,6 +29,9 @@ async def reconciliation_loop() -> None:
     await asyncio.sleep(15)
     while True:
         try:
+            changed = await synchronize_active_watch_scopes()
+            if changed:
+                LOGGER.info("Автоматически уточнён тип папки у %s наблюдений", changed)
             await reconcile_all_active()
         except asyncio.CancelledError:
             raise
@@ -35,24 +40,41 @@ async def reconciliation_loop() -> None:
         await asyncio.sleep(settings.reconcile_interval_minutes * 60)
 
 
+async def scheduled_reports_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await run_due_reports()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Проверка расписаний отчётов завершилась с ошибкой")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     set_handlers(app, enabled_handler)
     await init_database()
-    task = asyncio.create_task(reconciliation_loop()) if in_nextcloud_runtime() else None
+    tasks = (
+        [asyncio.create_task(reconciliation_loop()), asyncio.create_task(scheduled_reports_loop())]
+        if in_nextcloud_runtime()
+        else []
+    )
     LOGGER.info("Приложение запущено; хранилище=%s", settings.storage_path)
     try:
         yield
     finally:
-        if task:
+        for task in tasks:
             task.cancel()
+        for task in tasks:
             with suppress(asyncio.CancelledError):
                 await task
         await close_database()
 
 
 APP = FastAPI(
-    title="Сбор и контроль файлов",
+    title="Отчёт сдачи",
     version=settings.app_version,
     docs_url=None,
     redoc_url=None,

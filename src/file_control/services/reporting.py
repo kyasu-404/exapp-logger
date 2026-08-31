@@ -7,30 +7,45 @@ import uuid
 from collections.abc import Iterable
 from contextlib import suppress
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from ..config import get_settings
-from ..models import Campaign, FileDimensionValue, FileEvent, FileRecord, ParseStatus
-from ..serialization import EVENT_LABELS, file_dimensions
-from .progress import build_progress, filter_progress
+from ..models import ActivityEvent, EventType, FileRecord, FolderRecord, Watch
+from ..serialization import EVENT_LABELS, file_state
+from ..time_utils import as_local_naive
 
-STATUS_LABELS = {
-    "submitted": "Сдано",
-    "not_submitted": "Не сдано",
-    "partial": "Частично",
-    "overdue": "Просрочено",
-    "deleted": "Удалено",
-    "unrecognized": "Не распознано",
-}
+STATUS_LABELS = {"new": "Есть", "updated": "Обновлён", "deleted": "Удалён"}
+
+
+def human_size(value: int | None) -> str:
+    size = max(0, int(value or 0))
+    if size < 1024:
+        return f"{size} Б"
+    units = ("КБ", "МБ", "ГБ", "ТБ")
+    result = size / 1024
+    unit = units[0]
+    for candidate in units[1:]:
+        if result < 1024:
+            break
+        result /= 1024
+        unit = candidate
+    precision = 0 if result >= 10 else 1
+    rendered = f"{result:.{precision}f}".replace(".", ",")
+    return f"{rendered} {unit}"
+
+
+def report_stamp(value: datetime | None = None) -> str:
+    moment = value or datetime.now(UTC)
+    local = as_local_naive(moment)
+    return local.strftime("%Y-%m-%d_%H-%M-%S") if local else "report"
 
 
 def safe_filename(value: str) -> str:
@@ -65,46 +80,9 @@ def _configure_table(sheet, widths: list[int], rows: int, columns: int) -> None:
 def _date_cell(sheet, value: datetime | None):
     if value is None:
         return None
-    if value.tzinfo:
-        value = value.astimezone(UTC).replace(tzinfo=None)
-    cell = WriteOnlyCell(sheet, value=value)
+    cell = WriteOnlyCell(sheet, value=as_local_naive(value))
     cell.number_format = "dd.mm.yyyy hh:mm"
     return cell
-
-
-async def _files(session: AsyncSession, campaign_id: int) -> list[FileRecord]:
-    return list(
-        (
-            await session.scalars(
-                select(FileRecord)
-                .where(FileRecord.campaign_id == campaign_id)
-                .options(
-                    selectinload(FileRecord.organization),
-                    selectinload(FileRecord.dimension_values).selectinload(FileDimensionValue.dimension),
-                )
-                .order_by(FileRecord.first_received_at)
-            )
-        ).all()
-    )
-
-
-async def _events(session: AsyncSession, campaign_id: int) -> list[FileEvent]:
-    return list(
-        (
-            await session.scalars(
-                select(FileEvent)
-                .join(FileEvent.file)
-                .where(FileRecord.campaign_id == campaign_id)
-                .options(
-                    selectinload(FileEvent.file).selectinload(FileRecord.organization),
-                    selectinload(FileEvent.file)
-                    .selectinload(FileRecord.dimension_values)
-                    .selectinload(FileDimensionValue.dimension),
-                )
-                .order_by(FileEvent.occurred_at)
-            )
-        ).all()
-    )
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -113,332 +91,471 @@ def _aware(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=UTC)
 
 
-def _matches_dimensions(file: FileRecord, expected: dict[str, str]) -> bool:
-    actual = file_dimensions(file)
-    return all(actual.get(key, "").casefold() == value.casefold() for key, value in expected.items() if value)
+def _escaped_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _filter_files(files: list[FileRecord], filters: dict[str, Any]) -> list[FileRecord]:
-    result = []
-    expected_dimensions = filters.get("dimensions") or {}
-    for file in files:
-        if "organization_ids" in filters and file.organization_id not in filters["organization_ids"]:
-            continue
-        if filters.get("organization_id") and file.organization_id != filters["organization_id"]:
-            continue
-        parse_status = filters.get("parse_status")
-        if parse_status and file.parse_status.value != str(getattr(parse_status, "value", parse_status)):
-            continue
-        if filters.get("deleted") is not None and file.deleted is not filters["deleted"]:
-            continue
-        if filters.get("updated_only") and file.revision_count == 0:
-            continue
-        if filters.get("attention_only") and (file.parse_status == ParseStatus.OK or file.warning_ignored):
-            continue
-        extension = str(filters.get("extension") or "").strip().lstrip(".").casefold()
-        if extension and not file.filename.casefold().endswith(f".{extension}"):
-            continue
-        search = str(filters.get("search") or "").strip().casefold()
-        organization_text = ""
-        if file.organization:
-            organization_text = " ".join(
-                [file.organization.code, file.organization.name, file.organization.short_name]
-            ).casefold()
-        if search and search not in f"{file.filename} {file.full_path}".casefold() and search not in organization_text:
-            continue
-        if filters.get("date_from") and _aware(file.first_received_at) < _aware(filters["date_from"]):
-            continue
-        if filters.get("date_to") and _aware(file.first_received_at) > _aware(filters["date_to"]):
-            continue
-        if expected_dimensions and not _matches_dimensions(file, expected_dimensions):
-            continue
-        result.append(file)
-    return result
+def _file_conditions(watch_id: int, filters: dict[str, Any]) -> list[Any]:
+    conditions: list[Any] = [FileRecord.watch_id == watch_id]
+    search = str(filters.get("search") or "").strip()
+    if search:
+        token = f"%{_escaped_like(search)}%"
+        conditions.append(
+            or_(
+                FileRecord.filename.ilike(token, escape="\\"),
+                FileRecord.full_path.ilike(token, escape="\\"),
+            )
+        )
+    extension = str(filters.get("extension") or "").strip().lstrip(".").lower()
+    if extension:
+        conditions.append(FileRecord.extension == extension)
+    status = str(filters.get("status") or "")
+    if status == "deleted":
+        conditions.append(FileRecord.exists.is_(False))
+    elif status == "updated":
+        conditions.extend((FileRecord.exists.is_(True), FileRecord.revision_count > 0))
+    elif status == "new":
+        conditions.extend((FileRecord.exists.is_(True), FileRecord.revision_count == 0))
+    prefix = str(filters.get("path_prefix") or "").strip().strip("/")
+    if prefix:
+        escaped = _escaped_like(prefix)
+        conditions.append(
+            or_(
+                FileRecord.relative_path.ilike(escaped, escape="\\"),
+                FileRecord.relative_path.ilike(f"{escaped}/%", escape="\\"),
+            )
+        )
+    if filters.get("date_from"):
+        conditions.append(FileRecord.first_seen_at >= filters["date_from"])
+    if filters.get("date_to"):
+        conditions.append(FileRecord.first_seen_at <= filters["date_to"])
+    return conditions
 
 
-def _filter_events(events: list[FileEvent], filters: dict[str, Any]) -> list[FileEvent]:
-    result = []
-    for event in events:
-        if filters.get("organization_id") and event.file.organization_id != filters["organization_id"]:
-            continue
-        event_type = filters.get("event_type")
-        if event_type and event.event_type.value != str(getattr(event_type, "value", event_type)):
-            continue
-        search = str(filters.get("search") or "").strip().casefold()
-        if search and search not in f"{event.file.filename} {event.new_path} {event.old_path}".casefold():
-            continue
-        if filters.get("date_from") and _aware(event.occurred_at) < _aware(filters["date_from"]):
-            continue
-        if filters.get("date_to") and _aware(event.occurred_at) > _aware(filters["date_to"]):
-            continue
-        if filters.get("dimensions") and not _matches_dimensions(event.file, filters["dimensions"]):
-            continue
-        result.append(event)
-    return result
+def _event_conditions(watch: Watch, filters: dict[str, Any]) -> list[Any]:
+    conditions: list[Any] = [ActivityEvent.watch_id == watch.id]
+    search = str(filters.get("search") or "").strip()
+    if search:
+        token = f"%{_escaped_like(search)}%"
+        conditions.append(
+            or_(
+                ActivityEvent.path.ilike(token, escape="\\"),
+                ActivityEvent.old_path.ilike(token, escape="\\"),
+            )
+        )
+    event_type = filters.get("event_type")
+    if event_type:
+        conditions.append(ActivityEvent.event_type == event_type)
+    prefix = str(filters.get("path_prefix") or "").strip().strip("/")
+    if prefix:
+        full_prefix = f"{watch.root_path.rstrip('/')}/{prefix}"
+        escaped = _escaped_like(full_prefix)
+        conditions.append(
+            or_(
+                ActivityEvent.path.ilike(escaped, escape="\\"),
+                ActivityEvent.path.ilike(f"{escaped}/%", escape="\\"),
+                ActivityEvent.old_path.ilike(escaped, escape="\\"),
+                ActivityEvent.old_path.ilike(f"{escaped}/%", escape="\\"),
+            )
+        )
+    if filters.get("date_from"):
+        conditions.append(ActivityEvent.event_time >= filters["date_from"])
+    if filters.get("date_to"):
+        conditions.append(ActivityEvent.event_time <= filters["date_to"])
+    return conditions
 
 
-async def build_xlsx(
-    session: AsyncSession, campaign_id: int, filters: dict[str, Any] | None = None
-) -> tuple[Path, str]:
-    campaign = await session.scalar(
-        select(Campaign).where(Campaign.id == campaign_id).options(selectinload(Campaign.dimensions))
+def _folder_conditions(watch_id: int, filters: dict[str, Any]) -> list[Any]:
+    conditions: list[Any] = [FolderRecord.watch_id == watch_id]
+    prefix = str(filters.get("path_prefix") or "").strip().strip("/")
+    if prefix:
+        escaped = _escaped_like(prefix)
+        conditions.append(
+            or_(
+                FolderRecord.relative_path.ilike(escaped, escape="\\"),
+                FolderRecord.relative_path.ilike(f"{escaped}/%", escape="\\"),
+            )
+        )
+    if filters.get("date_from"):
+        conditions.append(FolderRecord.first_seen_at >= filters["date_from"])
+    if filters.get("date_to"):
+        conditions.append(FolderRecord.first_seen_at <= filters["date_to"])
+    return conditions
+
+
+def _ensure_folder_row(rows: dict[str, dict[str, Any]], path: str) -> dict[str, Any]:
+    return rows.setdefault(
+        path,
+        {"path": path, "files": 0, "first_seen_at": None, "last_seen_at": None, "size": 0},
     )
-    if campaign is None:
-        raise ValueError("Кампания не найдена")
+
+
+def _accumulate_folder_record(rows: dict[str, dict[str, Any]], folder: FolderRecord) -> None:
+    if not folder.exists:
+        return
+    parts = [part for part in PurePosixPath(folder.relative_path).parts if part not in {"/", "", "."}]
+    for depth in range(1, len(parts) + 1):
+        row = _ensure_folder_row(rows, "/".join(parts[:depth]))
+        if row["first_seen_at"] is None or folder.first_seen_at < row["first_seen_at"]:
+            row["first_seen_at"] = folder.first_seen_at
+        if row["last_seen_at"] is None or folder.last_seen_at > row["last_seen_at"]:
+            row["last_seen_at"] = folder.last_seen_at
+
+
+def _accumulate_file(rows: dict[str, dict[str, Any]], file: FileRecord) -> None:
+    parts = [part for part in PurePosixPath(file.parent_path).parts if part not in {"/", "", "."}]
+    for depth in range(1, len(parts) + 1):
+        row = _ensure_folder_row(rows, "/".join(parts[:depth]))
+        if file.exists:
+            row["files"] += 1
+            row["size"] += file.size
+        if row["first_seen_at"] is None or file.first_seen_at < row["first_seen_at"]:
+            row["first_seen_at"] = file.first_seen_at
+        if row["last_seen_at"] is None or file.last_seen_at > row["last_seen_at"]:
+            row["last_seen_at"] = file.last_seen_at
+
+
+async def build_xlsx(session: AsyncSession, watch_id: int, filters: dict[str, Any] | None = None) -> tuple[Path, str]:
+    watch = await session.get(Watch, watch_id)
+    if watch is None:
+        raise ValueError("Наблюдение не найдено")
     filters = filters or {}
-    progress = filter_progress(
-        await build_progress(session, campaign_id),
-        status_filter=filters.get("status", ""),
-        search=filters.get("search", ""),
-        organization_id=filters.get("organization_id"),
-        dimensions=filters.get("dimensions"),
+    generated_at = datetime.now(UTC)
+    file_conditions = _file_conditions(watch_id, filters)
+    event_conditions = _event_conditions(watch, filters)
+    file_count = await session.scalar(select(func.count(FileRecord.id)).where(*file_conditions)) or 0
+    event_count = await session.scalar(select(func.count(ActivityEvent.id)).where(*event_conditions)) or 0
+    max_depth = 0
+    parent_paths = await session.stream_scalars(
+        select(FileRecord.parent_path).where(*file_conditions).execution_options(yield_per=500)
     )
-    files = await _files(session, campaign_id)
-    events = await _events(session, campaign_id)
-    if any(filters.get(key) for key in ("status", "search", "organization_id", "dimensions")):
-        selected_organizations = {item["organization"]["id"] for item in progress["organizations"]}
-        file_filters = {
-            "organization_ids": selected_organizations,
-            "dimensions": filters.get("dimensions") or {},
-        }
-        files = _filter_files(files, file_filters)
-        selected_file_ids = {file.id for file in files}
-        events = [event for event in events if event.file_id in selected_file_ids]
+    async for parent_path in parent_paths:
+        max_depth = max(
+            max_depth,
+            len([part for part in PurePosixPath(parent_path).parts if part not in {"/", "", "."}]),
+        )
+    folder_data: dict[str, dict[str, Any]] = {}
+    folder_stream = await session.stream_scalars(
+        select(FolderRecord)
+        .where(*_folder_conditions(watch_id, filters))
+        .order_by(FolderRecord.relative_path, FolderRecord.id)
+        .execution_options(yield_per=500)
+    )
+    async for folder_record in folder_stream:
+        _accumulate_folder_record(folder_data, folder_record)
     workbook = Workbook(write_only=True)
 
-    summary = workbook.create_sheet("Сводка")
-    summary.append(["Кампания", campaign.name])
-    summary.append(["Период", campaign.start_at, campaign.deadline_at])
-    summary.append(["Дата формирования", _date_cell(summary, datetime.now(UTC))])
-    summary.append(["Организаций", len(progress["organizations"])])
-    summary.append(["Полностью сдали", progress["counts"]["submitted"]])
-    summary.append(["Частично", progress["counts"]["partial"]])
-    summary.append(["Не сдали", progress["counts"]["not_submitted"]])
-    summary.append(["Выполнение, %", progress["percent"]])
-    summary.append(["Файлов", len(files)])
-    summary.append([])
-    summary_headers = ["Организация", "Требуется", "Сдано", "Выполнение, %", "Последнее поступление", "Статус"]
-    summary.append(_header_cells(summary, summary_headers))
-    for item in progress["organizations"]:
-        summary.append(
-            [
-                item["organization"]["name"],
-                item["required"],
-                item["completed"],
-                item["percent"],
-                _date_cell(summary, item["last_received_at"]),
-                STATUS_LABELS.get(item["status"], item["status"]),
-            ]
-        )
-    for index, width in enumerate([38, 12, 12, 16, 22, 18], start=1):
-        summary.column_dimensions[get_column_letter(index)].width = width
-    summary.freeze_panes = "A11"
-    if progress["organizations"]:
-        summary.auto_filter.ref = f"A11:F{11 + len(progress['organizations'])}"
-
-    completion = workbook.create_sheet("Выполнение")
-    completion_headers = [
-        "Организация",
-        *[dimension.name for dimension in campaign.dimensions],
-        "Требуется",
-        "Получено",
-        "Первая сдача",
-        "Последняя сдача",
+    file_sheet = workbook.create_sheet("Файлы")
+    folder_headers = [f"Папка {index}" for index in range(1, max_depth + 1)]
+    file_headers = [
+        *folder_headers,
+        "Полный путь",
+        "Файл",
+        "Поступил",
+        "Последнее событие",
+        "Время загрузки в Nextcloud",
+        "Дата файла (mtime)",
+        "Размер",
+        "Тип",
         "Статус",
     ]
-    completion.append(_header_cells(completion, completion_headers))
-    completion_rows = 0
-    for org in progress["organizations"]:
-        for requirement in org["requirements"]:
-            dims = requirement["dimensions"]
-            dim_values = [dims.get(dimension.key, "") for dimension in campaign.dimensions]
-            completion.append(
-                [
-                    org["organization"]["name"],
-                    *dim_values,
-                    requirement["required"],
-                    requirement["received"],
-                    _date_cell(completion, requirement["first_received_at"]),
-                    _date_cell(completion, requirement["last_received_at"]),
-                    STATUS_LABELS.get(requirement["status"], requirement["status"]),
-                ]
-            )
-            completion_rows += 1
-    _configure_table(completion, [38] + [22] * (len(completion_headers) - 1), completion_rows, len(completion_headers))
-
-    missing_sheet = workbook.create_sheet("Не сдали")
-    missing_headers = ["Организация", "Параметры", "Срок", "Статус"]
-    missing_sheet.append(_header_cells(missing_sheet, missing_headers))
-    missing_rows = 0
-    for org in progress["organizations"]:
-        for requirement in org["requirements"]:
-            if requirement["status"] in {"submitted", "overdue"}:
-                continue
-            params = ", ".join(requirement["dimensions"].values())
-            missing_sheet.append(
-                [
-                    org["organization"]["name"],
-                    params,
-                    _date_cell(missing_sheet, requirement["deadline_at"]),
-                    STATUS_LABELS.get(requirement["status"], requirement["status"]),
-                ]
-            )
-            missing_rows += 1
-    _configure_table(missing_sheet, [38, 45, 22, 18], missing_rows, len(missing_headers))
-
-    file_sheet = workbook.create_sheet("Файлы")
-    dimension_keys = [dimension.key for dimension in campaign.dimensions]
-    dimension_names = [dimension.name for dimension in campaign.dimensions]
-    file_headers = [
-        "Организация",
-        *dimension_names,
-        "Файл",
-        "Тип",
-        "Размер",
-        "Поступил",
-        "Обновлён",
-        "Обновлений",
-        "Путь",
-        "Состояние",
-    ]
     file_sheet.append(_header_cells(file_sheet, file_headers))
-    for file in files:
-        dimensions = file_dimensions(file)
-        if file.deleted:
-            state = "Удалено"
-        elif file.parse_status != ParseStatus.OK:
-            state = "Не распознано"
-        elif file.revision_count:
-            state = "Обновлено"
-        else:
-            state = "Получено"
+    file_stream = await session.stream_scalars(
+        select(FileRecord)
+        .where(*file_conditions)
+        .order_by(FileRecord.first_seen_at, FileRecord.id)
+        .execution_options(yield_per=500)
+    )
+    async for file in file_stream:
+        parts = [part for part in PurePosixPath(file.parent_path).parts if part not in {"/", "", "."}]
         file_sheet.append(
             [
-                file.organization.name if file.organization else "Не распознано",
-                *[dimensions.get(key, "") for key in dimension_keys],
-                file.filename,
-                file.mime_type,
-                file.size,
-                _date_cell(file_sheet, file.first_received_at),
-                _date_cell(file_sheet, file.last_received_at),
-                file.revision_count,
+                *parts,
+                *([None] * (max_depth - len(parts))),
                 file.full_path,
-                state,
+                file.filename,
+                _date_cell(file_sheet, file.first_seen_at),
+                _date_cell(file_sheet, file.last_seen_at),
+                _date_cell(file_sheet, file.nextcloud_upload_time),
+                _date_cell(file_sheet, file.nextcloud_mtime),
+                human_size(file.size),
+                file.mime_type,
+                STATUS_LABELS[file_state(file)],
             ]
         )
+        _accumulate_file(folder_data, file)
     _configure_table(
-        file_sheet, [32] + [20] * len(dimension_keys) + [34, 22, 14, 22, 22, 12, 60, 18], len(files), len(file_headers)
+        file_sheet,
+        [22] * max_depth + [65, 35, 22, 22, 24, 22, 14, 28, 16],
+        file_count,
+        len(file_headers),
     )
 
     event_sheet = workbook.create_sheet("Активность")
-    event_headers = ["Время", "Организация", "Действие", "Файл", "Путь", "Пользователь"]
+    event_headers = [
+        "Время",
+        "Действие",
+        "Объект",
+        "Полный путь",
+        "Старый путь",
+        "Имя",
+        "Размер",
+        "Пользователь",
+    ]
     event_sheet.append(_header_cells(event_sheet, event_headers))
-    for event in events:
+    event_stream = await session.stream_scalars(
+        select(ActivityEvent)
+        .where(*event_conditions)
+        .order_by(ActivityEvent.event_time, ActivityEvent.id)
+        .execution_options(yield_per=500)
+    )
+    async for event in event_stream:
         event_sheet.append(
             [
-                _date_cell(event_sheet, event.occurred_at),
-                event.file.organization.name if event.file.organization else "Не распознано",
-                EVENT_LABELS.get(event.event_type.value, event.event_type.value),
-                event.file.filename,
-                event.new_path or event.old_path,
+                _date_cell(event_sheet, event.event_time),
+                EVENT_LABELS[event.event_type.value],
+                "Папка" if event.node_type == "folder" else "Файл",
+                event.path or event.new_path,
+                event.old_path,
+                PurePosixPath(event.path or event.new_path or event.old_path).name,
+                human_size(event.size),
                 event.actor_user_id,
             ]
         )
-    _configure_table(event_sheet, [22, 36, 28, 35, 60, 24], len(events), len(event_headers))
+    _configure_table(event_sheet, [22, 18, 14, 65, 65, 35, 14, 24], event_count, len(event_headers))
 
-    errors_sheet = workbook.create_sheet("Ошибки")
-    error_headers = ["Организация", "Файл", "Путь", "Проблема", "Игнорировано"]
-    errors_sheet.append(_header_cells(errors_sheet, error_headers))
-    errors = [file for file in files if file.parse_status != ParseStatus.OK]
-    for file in errors:
-        errors_sheet.append(
+    folder_sheet = workbook.create_sheet("По папкам")
+    folder_headers = [
+        "Путь папки",
+        "Файлов",
+        "Первое поступление",
+        "Последнее поступление",
+        "Размер",
+    ]
+    folder_sheet.append(_header_cells(folder_sheet, folder_headers))
+    folders = sorted(folder_data.values(), key=lambda row: row["path"].casefold())
+    for folder in folders:
+        folder_sheet.append(
             [
-                file.organization.name if file.organization else "Не распознано",
-                file.filename,
-                file.full_path,
-                file.parse_message,
-                "Да" if file.warning_ignored else "Нет",
+                folder["path"],
+                folder["files"],
+                _date_cell(folder_sheet, folder["first_seen_at"]),
+                _date_cell(folder_sheet, folder["last_seen_at"]),
+                human_size(folder["size"]),
             ]
         )
-    _configure_table(errors_sheet, [36, 34, 60, 60, 14], len(errors), len(error_headers))
+    _configure_table(folder_sheet, [65, 14, 22, 22, 14], len(folders), len(folder_headers))
+
+    notes_sheet = workbook.create_sheet("Пояснения")
+    notes_sheet.append(_header_cells(notes_sheet, ["Поле", "Что означает"]))
+    notes = [
+        ("Отчёт сформирован", _date_cell(notes_sheet, generated_at)),
+        ("Поступил", "Когда ExApp впервые зарегистрировал файл."),
+        ("Последнее событие", "Когда ExApp в последний раз зафиксировал изменение состояния файла."),
+        ("Время загрузки в Nextcloud", "Когда Nextcloud принял файл; значение свойства nc:upload_time."),
+        (
+            "Дата файла (mtime)",
+            "Дата изменения, переданная клиентом или источником файла. Она может быть раньше времени загрузки "
+            "и сама по себе не означает редактирование в офисном приложении.",
+        ),
+        ("Размер", "Размер файла в удобном для чтения виде: Б, КБ, МБ, ГБ или ТБ."),
+        (
+            "Листы",
+            "«Файлы» — текущее состояние файлов; события папок и полная хронология находятся на листе «Активность».",
+        ),
+    ]
+    for row in notes:
+        notes_sheet.append(row)
+    _configure_table(notes_sheet, [32, 110], len(notes), 2)
 
     output = _temp_report(".xlsx")
     workbook.save(output)
-    filename = safe_filename(f"Отчёт_{campaign.name}_{datetime.now().date().isoformat()}") + ".xlsx"
+    filename = safe_filename(f"Наблюдение_{watch.name}_{report_stamp(generated_at)}") + ".xlsx"
     return output, filename
 
 
 def _csv_value(value: Any) -> Any:
     if isinstance(value, datetime):
-        return value.astimezone(UTC).strftime("%d.%m.%Y %H:%M") if value.tzinfo else value.strftime("%d.%m.%Y %H:%M")
+        local_value = as_local_naive(value)
+        return local_value.strftime("%d.%m.%Y %H:%M") if local_value else ""
     return value
 
 
 async def build_csv(
     session: AsyncSession,
-    campaign_id: int,
+    watch_id: int,
     table: str,
     filters: dict[str, Any] | None = None,
 ) -> tuple[Path, str]:
-    campaign = await session.get(Campaign, campaign_id)
-    if campaign is None:
-        raise ValueError("Кампания не найдена")
+    watch = await session.get(Watch, watch_id)
+    if watch is None:
+        raise ValueError("Наблюдение не найдено")
     filters = filters or {}
     output = _temp_report(".csv")
     with output.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream, delimiter=";", quoting=csv.QUOTE_MINIMAL)
-        if table == "progress":
-            progress = filter_progress(
-                await build_progress(session, campaign_id),
-                status_filter=filters.get("status", ""),
-                search=filters.get("search", ""),
-                organization_id=filters.get("organization_id"),
-                dimensions=filters.get("dimensions"),
+        if table == "events":
+            writer.writerow(
+                [
+                    "Время",
+                    "Действие",
+                    "Объект",
+                    "Полный путь",
+                    "Старый путь",
+                    "Имя",
+                    "Размер",
+                ]
             )
-            writer.writerow(["Организация", "Выполнено", "Требуется", "Выполнение, %", "Последняя сдача", "Статус"])
-            for item in progress["organizations"]:
+            events = await session.stream_scalars(
+                select(ActivityEvent)
+                .where(*_event_conditions(watch, filters))
+                .order_by(ActivityEvent.event_time, ActivityEvent.id)
+                .execution_options(yield_per=500)
+            )
+            async for event in events:
                 writer.writerow(
                     [
-                        item["organization"]["name"],
-                        item["completed"],
-                        item["required"],
-                        item["percent"],
-                        _csv_value(item["last_received_at"]),
-                        STATUS_LABELS.get(item["status"], item["status"]),
+                        _csv_value(event.event_time),
+                        EVENT_LABELS[event.event_type.value],
+                        "Папка" if event.node_type == "folder" else "Файл",
+                        event.path or event.new_path,
+                        event.old_path,
+                        PurePosixPath(event.path or event.new_path or event.old_path).name,
+                        human_size(event.size),
                     ]
                 )
-        elif table == "events":
-            events = _filter_events(await _events(session, campaign_id), filters)
-            writer.writerow(["Время", "Организация", "Действие", "Файл", "Путь"])
-            for event in events:
+        elif table == "folders":
+            writer.writerow(["Путь папки", "Файлов", "Первое поступление", "Последнее поступление", "Размер"])
+            folder_data: dict[str, dict[str, Any]] = {}
+            folders = await session.stream_scalars(
+                select(FolderRecord).where(*_folder_conditions(watch_id, filters)).execution_options(yield_per=500)
+            )
+            async for folder_record in folders:
+                _accumulate_folder_record(folder_data, folder_record)
+            files = await session.stream_scalars(
+                select(FileRecord).where(*_file_conditions(watch_id, filters)).execution_options(yield_per=500)
+            )
+            async for file in files:
+                _accumulate_file(folder_data, file)
+            for folder in sorted(folder_data.values(), key=lambda row: row["path"].casefold()):
                 writer.writerow(
                     [
-                        _csv_value(event.occurred_at),
-                        event.file.organization.name if event.file.organization else "Не распознано",
-                        EVENT_LABELS.get(event.event_type.value, event.event_type.value),
-                        event.file.filename,
-                        event.new_path or event.old_path,
+                        folder["path"],
+                        folder["files"],
+                        _csv_value(folder["first_seen_at"]),
+                        _csv_value(folder["last_seen_at"]),
+                        human_size(folder["size"]),
                     ]
                 )
         else:
-            files = _filter_files(await _files(session, campaign_id), filters)
-            writer.writerow(["Организация", "Параметры", "Файл", "Размер", "Поступил", "Обновлён", "Путь", "Состояние"])
-            for file in files:
+            writer.writerow(
+                [
+                    "Путь",
+                    "Файл",
+                    "Поступил",
+                    "Последнее событие",
+                    "Время загрузки в Nextcloud",
+                    "Дата файла (mtime)",
+                    "Размер",
+                    "Статус",
+                ]
+            )
+            files = await session.stream_scalars(
+                select(FileRecord)
+                .where(*_file_conditions(watch_id, filters))
+                .order_by(FileRecord.first_seen_at, FileRecord.id)
+                .execution_options(yield_per=500)
+            )
+            async for file in files:
                 writer.writerow(
                     [
-                        file.organization.name if file.organization else "Не распознано",
-                        ", ".join(file_dimensions(file).values()),
-                        file.filename,
-                        file.size,
-                        _csv_value(file.first_received_at),
-                        _csv_value(file.last_received_at),
                         file.full_path,
-                        "Удалено"
-                        if file.deleted
-                        else ("Не распознано" if file.parse_status != ParseStatus.OK else "Получено"),
+                        file.filename,
+                        _csv_value(file.first_seen_at),
+                        _csv_value(file.last_seen_at),
+                        _csv_value(file.nextcloud_upload_time),
+                        _csv_value(file.nextcloud_mtime),
+                        human_size(file.size),
+                        STATUS_LABELS[file_state(file)],
                     ]
                 )
-    filename = safe_filename(f"{table}_{campaign.name}_{datetime.now().date().isoformat()}") + ".csv"
+    filename = safe_filename(f"{table}_{watch.name}_{report_stamp()}") + ".csv"
+    return output, filename
+
+
+CHANGE_CATEGORIES = {
+    EventType.CREATED: "Добавлено",
+    EventType.COPIED: "Добавлено",
+    EventType.UPDATED: "Изменено",
+    EventType.MOVED: "Перемещено",
+    EventType.RENAMED: "Перемещено",
+    EventType.DELETED: "Удалено",
+}
+
+
+async def build_changes_xlsx(
+    session: AsyncSession,
+    watch_id: int,
+    date_from: datetime,
+    date_to: datetime,
+    path_prefix: str = "",
+) -> tuple[Path, str]:
+    if _aware(date_to) < _aware(date_from):
+        raise ValueError("Дата окончания не может быть раньше даты начала")
+    watch = await session.get(Watch, watch_id)
+    if watch is None:
+        raise ValueError("Наблюдение не найдено")
+    event_filters = {"date_from": date_from, "date_to": date_to, "path_prefix": path_prefix}
+    conditions = _event_conditions(watch, event_filters)
+    counts = {label: 0 for label in ("Добавлено", "Изменено", "Перемещено", "Удалено")}
+    grouped = (
+        await session.execute(
+            select(ActivityEvent.event_type, func.count(ActivityEvent.id))
+            .where(*conditions)
+            .group_by(ActivityEvent.event_type)
+        )
+    ).all()
+    for event_type, count in grouped:
+        counts[CHANGE_CATEGORIES[event_type]] += count
+    event_count = sum(counts.values())
+
+    workbook = Workbook(write_only=True)
+    summary = workbook.create_sheet("Итоги")
+    summary.append(_header_cells(summary, ["Показатель", "Значение"]))
+    summary.append(["Наблюдение", watch.name])
+    summary.append(["Период с", _date_cell(summary, date_from)])
+    summary.append(["Период по", _date_cell(summary, date_to)])
+    summary.append(["Ветка", path_prefix or "Всё наблюдение"])
+    for label, count in counts.items():
+        summary.append([label, count])
+    _configure_table(summary, [28, 60], 8, 2)
+
+    changes = workbook.create_sheet("Изменения")
+    headers = ["Время (МСК)", "Изменение", "Объект", "Путь", "Предыдущий путь", "Размер", "Пользователь"]
+    changes.append(_header_cells(changes, headers))
+    events = await session.stream_scalars(
+        select(ActivityEvent)
+        .where(*conditions)
+        .order_by(ActivityEvent.event_time, ActivityEvent.id)
+        .execution_options(yield_per=500)
+    )
+    async for event in events:
+        changes.append(
+            [
+                _date_cell(changes, event.event_time),
+                CHANGE_CATEGORIES[event.event_type],
+                "Папка" if event.node_type == "folder" else "Файл",
+                event.path or event.new_path,
+                event.old_path,
+                human_size(event.size),
+                event.actor_user_id,
+            ]
+        )
+    _configure_table(changes, [22, 18, 14, 70, 70, 14, 24], event_count, len(headers))
+
+    output = _temp_report(".xlsx")
+    workbook.save(output)
+    filename = safe_filename(f"Изменения_{watch.name}_{report_stamp(date_from)}_{report_stamp(date_to)}") + ".xlsx"
     return output, filename
 
 

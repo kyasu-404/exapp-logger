@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nextcloud-file-control"
-version = "1.0.0"
-description = "Nextcloud ExApp for collection and audit of files"
+version = "2.3.0"
+description = "Nextcloud ExApp for path-based file observation and audit"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "AGPL-3.0-or-later" }
@@ -16,7 +16,6 @@ dependencies = [
   "nc-py-api[app]==0.30.3",
   "openpyxl==3.1.5",
   "pydantic-settings==2.15.0",
-  "python-multipart==0.0.20",
   "SQLAlchemy==2.0.52",
 ]
 
@@ -45,4 +44,3 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["B008"]
-

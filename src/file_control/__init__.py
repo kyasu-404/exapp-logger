@@ -1,3 +1,3 @@
-"""Nextcloud ExApp for tracking file collection campaigns."""
+"""Nextcloud ExApp for path-based file observation."""
 
-__version__ = "1.0.0"
+__version__ = "2.3.0"

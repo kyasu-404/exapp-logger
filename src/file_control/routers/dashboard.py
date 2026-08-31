@@ -1,68 +1,91 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings, in_nextcloud_runtime
 from ..db import get_session
-from ..models import Campaign, CampaignStatus, FileRecord, ParseStatus
-from ..security import require_admin, require_observer
-from ..serialization import campaign_dict
-from ..services.progress import build_summary
+from ..models import FileRecord, Watch, WatchStatus
+from ..schemas import normalize_path
+from ..security import filter_accessible_watches, is_admin_user, require_admin, require_observer
+from ..serialization import file_dict, watch_dict
+from ..services.folder_scope import inspect_folder, list_available_groups
+from ..time_utils import start_of_local_day_utc
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 
 @router.get("/dashboard")
 async def dashboard(
-    _user: str = Depends(require_observer),
+    current_user: str = Depends(require_observer),
     session: AsyncSession = Depends(get_session),
 ):
-    campaigns = list(
+    watches = list(
         (
             await session.scalars(
-                select(Campaign).where(Campaign.status == CampaignStatus.ACTIVE).order_by(Campaign.deadline_at)
+                select(Watch).where(Watch.status == WatchStatus.ACTIVE).order_by(Watch.ended_at, Watch.created_at)
             )
         ).all()
     )
-    summaries = []
-    for campaign in campaigns:
-        summary = await build_summary(session, campaign.id)
-        summaries.append({"campaign": campaign_dict(campaign), "summary": summary})
-    start_today = datetime.combine(datetime.now(UTC).date(), time.min, tzinfo=UTC)
-    files_today = (
-        await session.scalar(select(func.count(FileRecord.id)).where(FileRecord.first_received_at >= start_today)) or 0
-    )
-    organizations_today = (
+    watches = await filter_accessible_watches(current_user, watches)
+    watch_ids = [item.id for item in watches]
+    start_today = start_of_local_day_utc()
+    watch_condition = FileRecord.watch_id.in_(watch_ids)
+    files_now = (
         await session.scalar(
-            select(func.count(func.distinct(FileRecord.organization_id))).where(
-                FileRecord.first_received_at >= start_today,
-                FileRecord.organization_id.is_not(None),
-            )
+            select(func.count(FileRecord.id)).where(watch_condition, FileRecord.exists.is_(True))
         )
         or 0
     )
-    unrecognized = (
+    files_today = (
+        await session.scalar(
+            select(func.count(FileRecord.id)).where(watch_condition, FileRecord.first_seen_at >= start_today)
+        )
+        or 0
+    )
+    updated_today = (
         await session.scalar(
             select(func.count(FileRecord.id)).where(
-                FileRecord.parse_status != ParseStatus.OK,
-                FileRecord.warning_ignored.is_(False),
+                watch_condition,
+                FileRecord.revision_count > 0,
+                FileRecord.last_seen_at >= start_today,
             )
         )
         or 0
+    )
+    deleted = (
+        await session.scalar(
+            select(func.count(FileRecord.id)).where(watch_condition, FileRecord.exists.is_(False))
+        )
+        or 0
+    )
+    recent = list(
+        (
+            await session.scalars(
+                select(FileRecord)
+                .where(watch_condition)
+                .order_by(FileRecord.first_seen_at.desc())
+                .limit(10)
+            )
+        ).all()
     )
     return {
         "metrics": {
-            "active_campaigns": len(campaigns),
-            "files_today": files_today,
-            "organizations_today": organizations_today,
-            "unrecognized": unrecognized,
+            "active_watches": len(watches),
+            "files": files_now,
+            "received_today": files_today,
+            "updated_today": updated_today,
+            "deleted": deleted,
         },
-        "campaigns": summaries,
+        "watches": [watch_dict(item) for item in watches],
+        "recent_files": [file_dict(item) for item in recent],
     }
+
+
+@router.get("/access")
+async def access(current_user: str = Depends(require_observer)):
+    return {"is_admin": await is_admin_user(current_user)}
 
 
 @router.get("/folders")
@@ -92,12 +115,41 @@ async def folders(
         raise HTTPException(status_code=502, detail=f"Не удалось получить список папок: {exc}") from exc
 
 
+@router.get("/groups")
+async def groups(current_user: str = Depends(require_admin)):
+    try:
+        return {"items": await list_available_groups(current_user)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Не удалось получить группы Nextcloud: {exc}") from exc
+
+
+@router.get("/folder-info")
+async def folder_info(path: str, current_user: str = Depends(require_admin)):
+    try:
+        normalized = normalize_path(path)
+        result = (await inspect_folder(normalized, current_user)).as_dict()
+        result["path"] = normalized
+        result["available_groups"] = (
+            await list_available_groups(current_user)
+            if result["scope_type"] == "personal"
+            else []
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось определить тип папки через Nextcloud: {exc}",
+        ) from exc
+
+
 @router.get("/system/status")
 async def system_status(
     _user: str = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ):
-    await session.scalar(select(func.count(Campaign.id)))
+    await session.scalar(select(func.count(Watch.id)))
     settings = get_settings()
     return {
         "status": "ok",
