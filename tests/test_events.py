@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import csv
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from openpyxl import load_workbook
 from sqlalchemy import func, select
 
 from file_control.db import SessionFactory
-from file_control.models import ActivityEvent, EventType, FileRecord, FolderRecord, Watch, WatchStatus
+from file_control.models import (
+    ActivityEvent,
+    EventType,
+    FileRecord,
+    FolderRecord,
+    ReconciliationRun,
+    Watch,
+    WatchStatus,
+)
+from file_control.routers.watches import watch_files, watch_summary
 from file_control.services import events as event_service
 from file_control.services import reconciliation as reconciliation_service
 from file_control.services.events import (
@@ -18,7 +29,7 @@ from file_control.services.events import (
 )
 from file_control.services.reconciliation import _event as reconciliation_event
 from file_control.services.reconciliation import refresh_file_metadata
-from file_control.services.reporting import build_changes_xlsx, build_xlsx, remove_report
+from file_control.services.reporting import build_changes_xlsx, build_csv, build_xlsx, remove_report
 
 
 async def seed_watch(
@@ -309,3 +320,206 @@ async def test_outside_tree_is_ignored() -> None:
     await seed_watch()
     result = await process_event_payload(legacy_event("NodeCreatedEvent", path="/Другая папка/любая/глубина/file.xlsx"))
     assert result == {"matched": 0, "changed": 0}
+
+
+@pytest.mark.asyncio
+async def test_replacement_at_same_path_keeps_both_files_and_ignores_old_deletion() -> None:
+    await seed_watch()
+    path = "/Олимпиада 2026/result.xlsx"
+    original = legacy_event("NodeCreatedEvent", path=path)
+    await process_event_payload(original)
+    replacement = legacy_event("NodeCreatedEvent", path=path)
+    replacement["event_data"]["target"]["fileId"] = "9002"
+    await process_event_payload(replacement)
+    await process_event_payload(legacy_event("NodeDeletedEvent", path=path))
+
+    async with SessionFactory() as session:
+        files = (await session.scalars(select(FileRecord).order_by(FileRecord.id))).all()
+        assert [(item.nextcloud_file_id, item.exists) for item in files] == [("9001", False), ("9002", True)]
+        assert files[0].first_seen_at < files[1].first_seen_at
+
+
+@pytest.mark.asyncio
+async def test_repeat_update_counts_only_one_revision() -> None:
+    await seed_watch()
+    path = "/Олимпиада 2026/result.xlsx"
+    await process_event_payload(legacy_event("NodeCreatedEvent", path=path))
+    update = legacy_event("NodeWrittenEvent", path=path, etag="v2")
+    await process_event_payload(update)
+    duplicate = await process_event_payload(update)
+
+    async with SessionFactory() as session:
+        file = await session.scalar(select(FileRecord))
+        assert duplicate["changed"] == 0
+        assert file.revision_count == 1
+        assert await session.scalar(select(func.count(ActivityEvent.id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_known_deletion_can_identify_a_legacy_unidentified_record() -> None:
+    await seed_watch()
+    path = "/Олимпиада 2026/result.xlsx"
+    create = legacy_event("NodeCreatedEvent", path=path)
+    create["event_data"]["target"].pop("fileId")
+    await process_event_payload(create)
+    assert (await process_event_payload(legacy_event("NodeDeletedEvent", path=path)))["changed"] == 1
+    async with SessionFactory() as session:
+        file = await session.scalar(select(FileRecord))
+        assert not file.exists
+        assert file.nextcloud_file_id == "9001"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_type, model", [("file", FileRecord), ("dir", FolderRecord)])
+async def test_same_node_can_reappear_after_deletion(file_type, model) -> None:
+    await seed_watch()
+    path = "/Олимпиада 2026/result"
+    create = legacy_event("NodeCreatedEvent", path=path, file_type=file_type)
+    delete = legacy_event("NodeDeletedEvent", path=path, file_type=file_type)
+    create["time"] = delete["time"] = 1795183200
+    for payload in (create, delete, create, create, delete, delete, create):
+        await process_event_payload(payload)
+
+    async with SessionFactory() as session:
+        record = await session.scalar(select(model))
+        assert record.exists is True
+        assert record.deleted_at is None
+        activity = (await session.scalars(select(ActivityEvent.event_type).order_by(ActivityEvent.id))).all()
+        assert activity == [
+            EventType.CREATED, EventType.DELETED, EventType.CREATED, EventType.DELETED, EventType.CREATED
+        ]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_waits_for_fresh_listing_after_interleaved_webhook(monkeypatch) -> None:
+    import nc_py_api
+
+    watch_id = await seed_watch()
+    path = "/Олимпиада 2026/result.xlsx"
+    listed = False
+
+    async def interleaved_tree(_nc, _owner, _root):
+        nonlocal listed
+        if not listed:
+            listed = True
+            await process_event_payload(legacy_event("NodeCreatedEvent", path=path))
+            return []
+        return [NodeSnapshot("collector", path, file_id="9001", etag="v1", size=1024)]
+
+    monkeypatch.setattr(reconciliation_service, "_tree_snapshots", interleaved_tree)
+    monkeypatch.setattr(nc_py_api, "AsyncNextcloudApp", lambda **_kwargs: object())
+    result = await reconciliation_service.reconcile_watch(watch_id)
+
+    async with SessionFactory() as session:
+        assert result["status"] == "completed"
+        assert result["missing"] == 0
+        assert (await session.scalar(select(FileRecord))).exists is True
+        deletions = await session.scalar(
+            select(func.count(ActivityEvent.id)).where(ActivityEvent.event_type == EventType.DELETED)
+        )
+        assert deletions == 0
+
+
+@pytest.mark.asyncio
+async def test_webhook_from_during_dav_listing_is_applied_after_scan_finishes(monkeypatch) -> None:
+    import nc_py_api
+
+    watch_id = await seed_watch()
+    path = "/Олимпиада 2026/result.xlsx"
+    start = datetime(2026, 11, 21, 12, tzinfo=UTC)
+    clock = start + timedelta(milliseconds=500)
+
+    async def tree_before_deletion(_nc, _owner, _root):
+        nonlocal clock
+        clock = start + timedelta(seconds=30)
+        return [NodeSnapshot("collector", path, file_id="9001")]
+
+    monkeypatch.setattr(reconciliation_service, "utcnow", lambda: clock)
+    monkeypatch.setattr(reconciliation_service, "_tree_snapshots", tree_before_deletion)
+    monkeypatch.setattr(nc_py_api, "AsyncNextcloudApp", lambda **_kwargs: object())
+    await reconciliation_service.reconcile_watch(watch_id)
+
+    deletion = legacy_event("NodeDeletedEvent", path=path)
+    deletion["time"] = int(start.timestamp())
+    assert (await process_event_payload(deletion))["changed"] == 1
+    async with SessionFactory() as session:
+        assert (await session.scalar(select(FileRecord))).exists is False
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_counts_each_recorded_revision_once(monkeypatch) -> None:
+    import nc_py_api
+
+    watch_id = await seed_watch()
+    snapshots = iter(("v1", "v2", "v3", "v2"))
+
+    async def tree(_nc, _owner, _root):
+        return [NodeSnapshot("collector", "/Олимпиада 2026/result.xlsx", file_id="9001", etag=next(snapshots))]
+
+    monkeypatch.setattr(reconciliation_service, "_tree_snapshots", tree)
+    monkeypatch.setattr(nc_py_api, "AsyncNextcloudApp", lambda **_kwargs: object())
+    for _ in range(4):
+        await reconciliation_service.reconcile_watch(watch_id)
+
+    async with SessionFactory() as session:
+        file = await session.scalar(select(FileRecord))
+        assert file.etag == "v2"
+        assert file.revision_count == 2
+        assert await session.scalar(
+            select(func.count(ActivityEvent.id)).where(ActivityEvent.event_type == EventType.UPDATED)
+        ) == 2
+
+
+@pytest.mark.asyncio
+async def test_exports_keep_user_provided_names_as_text() -> None:
+    watch_id = await seed_watch()
+    filename = "=example.xlsx"
+    await process_event_payload(legacy_event("NodeCreatedEvent", path=f"/Олимпиада 2026/{filename}"))
+    async with SessionFactory() as session:
+        xlsx, _ = await build_xlsx(session, watch_id)
+        csv_file, _ = await build_csv(session, watch_id, "files")
+    try:
+        workbook = load_workbook(xlsx, read_only=True)
+        try:
+            cells = next(workbook["Файлы"].iter_rows(min_row=2))
+            assert next(cell for cell in cells if cell.value == filename).data_type == "s"
+        finally:
+            workbook.close()
+        with csv_file.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.reader(stream, delimiter=";"))
+        assert "'" + filename in rows[1]
+    finally:
+        remove_report(xlsx)
+        remove_report(csv_file)
+
+
+@pytest.mark.asyncio
+async def test_summary_keeps_historical_error_and_counts_recent_activity(monkeypatch) -> None:
+    watch_id = await seed_watch()
+    path = "/Олимпиада 2026/525/result.xlsx"
+    await process_event_payload(legacy_event("NodeCreatedEvent", path=path))
+    await process_event_payload(legacy_event("NodeWrittenEvent", path=path, etag="v2"))
+    await process_event_payload(legacy_event("NodeDeletedEvent", path=path))
+    now = datetime.now(UTC)
+    monkeypatch.setattr("file_control.routers.watches.start_of_local_day_utc", lambda: now - timedelta(hours=1))
+
+    async with SessionFactory() as session:
+        session.add_all([
+            ReconciliationRun(watch_id=watch_id, started_at=now - timedelta(hours=2), status="failed", error="503"),
+            ReconciliationRun(watch_id=watch_id, started_at=now - timedelta(hours=1), status="completed"),
+            ReconciliationRun(watch_id=watch_id, started_at=now, status="running"),
+        ])
+        await session.commit()
+        summary = await watch_summary(watch_id, current_user="collector", session=session)
+        assert summary["diagnostics"]["last_error"] == "503"
+        assert summary["diagnostics"]["last_error_resolved"] is True
+        assert summary["metrics"] == {
+            "files": 0, "received_today": 1, "updated_today": 1, "deleted": 1, "folders": 1
+        }
+        assert summary["tree"][0]["updates"] == summary["tree"][0]["deleted"] == 1
+
+        page = await watch_files(
+            watch_id, page=3, page_size=1, file_status="", current_user="collector", session=session
+        )
+        assert page["page"] == page["pages"] == 1
+        assert [item["filename"] for item in page["items"]] == ["result.xlsx"]

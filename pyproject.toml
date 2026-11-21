@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nextcloud-file-control"
-version = "2.3.0"
+version = "2.3.1"
 description = "Nextcloud ExApp for path-based file observation and audit"
 readme = "README.md"
 requires-python = ">=3.12"

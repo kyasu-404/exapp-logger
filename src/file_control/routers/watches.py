@@ -188,12 +188,28 @@ async def archive_watch(
     await session.commit()
 
 
-def build_folder_stats(
-    watch: Watch,
-    files: list[FileRecord],
-    events: list[ActivityEvent],
-    folder_records: list[FolderRecord] | None = None,
-) -> list[dict]:
+async def build_folder_stats(session: AsyncSession, watch: Watch) -> list[dict]:
+    folder_records = await session.execute(
+        select(FolderRecord.relative_path, FolderRecord.first_seen_at, FolderRecord.last_seen_at)
+        .where(FolderRecord.watch_id == watch.id, FolderRecord.exists.is_(True))
+    )
+    files = await session.execute(
+        select(
+            FileRecord.parent_path,
+            func.count().filter(FileRecord.exists.is_(True)).label("live_files"),
+            func.coalesce(func.sum(FileRecord.size).filter(FileRecord.exists.is_(True)), 0).label("live_size"),
+            func.min(FileRecord.first_seen_at).label("first_seen_at"),
+            func.max(FileRecord.last_seen_at).label("last_seen_at"),
+        ).where(FileRecord.watch_id == watch.id).group_by(FileRecord.parent_path)
+    )
+    event_path = func.coalesce(
+        func.nullif(ActivityEvent.path, ""), func.nullif(ActivityEvent.new_path, ""), ActivityEvent.old_path
+    )
+    event_counts = await session.execute(
+        select(event_path, ActivityEvent.event_type, func.count())
+        .where(ActivityEvent.watch_id == watch.id, ActivityEvent.event_type.in_((EventType.UPDATED, EventType.DELETED)))
+        .group_by(event_path, ActivityEvent.event_type)
+    )
     folders: dict[str, dict] = {}
 
     def ensure(path: str) -> dict:
@@ -212,9 +228,7 @@ def build_folder_stats(
             },
         )
 
-    for folder in folder_records or []:
-        if not folder.exists:
-            continue
+    for folder in folder_records:
         parts = [part for part in PurePosixPath(folder.relative_path).parts if part not in {"/", "", "."}]
         for depth in range(1, len(parts) + 1):
             item = ensure("/".join(parts[:depth]))
@@ -228,16 +242,15 @@ def build_folder_stats(
         for depth in range(1, len(parent_parts) + 1):
             path = "/".join(parent_parts[:depth])
             item = ensure(path)
-            if file.exists:
-                item["files"] += 1
-                item["size"] += file.size
+            item["files"] += file.live_files
+            item["size"] += file.live_size
             if item["first_seen_at"] is None or file.first_seen_at < item["first_seen_at"]:
                 item["first_seen_at"] = file.first_seen_at
             if item["last_seen_at"] is None or file.last_seen_at > item["last_seen_at"]:
                 item["last_seen_at"] = file.last_seen_at
 
-    for event in events:
-        relative = relative_to_watch(event.path or event.new_path or event.old_path, watch.root_path)
+    for path, event_type, count in event_counts:
+        relative = relative_to_watch(path, watch.root_path)
         if relative is None:
             continue
         parent_parts = [part for part in PurePosixPath(relative).parent.parts if part not in {"/", ".", ""}]
@@ -245,10 +258,8 @@ def build_folder_stats(
             item = folders.get("/".join(parent_parts[:depth]))
             if item is None:
                 continue
-            if event.event_type == EventType.UPDATED:
-                item["updates"] += 1
-            elif event.event_type == EventType.DELETED:
-                item["deleted"] += 1
+            field = "updates" if event_type == EventType.UPDATED else "deleted"
+            item[field] += count
     return sorted(folders.values(), key=lambda item: (item["path"].casefold(), item["depth"]))
 
 
@@ -259,15 +270,27 @@ async def watch_summary(
     session: AsyncSession = Depends(get_session),
 ):
     watch = await _watch(session, watch_id, current_user)
-    files = list(
-        (
-            await session.scalars(
-                select(FileRecord).where(FileRecord.watch_id == watch_id).order_by(FileRecord.first_seen_at.desc())
-            )
-        ).all()
+    start_today = start_of_local_day_utc()
+    files, received_today, deleted = (
+        await session.execute(
+            select(
+                func.count().filter(FileRecord.exists.is_(True)),
+                func.count().filter(FileRecord.first_seen_at >= start_today),
+                func.count().filter(FileRecord.exists.is_(False)),
+            ).where(FileRecord.watch_id == watch_id)
+        )
+    ).one()
+    updated_today = await session.scalar(
+        select(func.count()).where(
+            ActivityEvent.watch_id == watch_id,
+            ActivityEvent.event_type == EventType.UPDATED,
+            ActivityEvent.event_time >= start_today,
+        )
     )
-    events = list((await session.scalars(select(ActivityEvent).where(ActivityEvent.watch_id == watch_id))).all())
-    folder_records = list((await session.scalars(select(FolderRecord).where(FolderRecord.watch_id == watch_id))).all())
+    recent_files = await session.scalars(
+        select(FileRecord).where(FileRecord.watch_id == watch_id)
+        .order_by(FileRecord.first_seen_at.desc(), FileRecord.id.desc()).limit(10)
+    )
     last_run = await session.scalar(
         select(ReconciliationRun)
         .where(ReconciliationRun.watch_id == watch_id)
@@ -280,23 +303,29 @@ async def watch_summary(
         .order_by(ReconciliationRun.started_at.desc(), ReconciliationRun.id.desc())
         .limit(1)
     )
-    start_today = start_of_local_day_utc()
-    folder_stats = build_folder_stats(watch, files, events, folder_records)
+    last_error_resolved = last_failed_run is not None and await session.scalar(
+        select(
+            select(ReconciliationRun.id).where(
+                ReconciliationRun.watch_id == watch_id,
+                ReconciliationRun.id > last_failed_run.id,
+                ReconciliationRun.status == "completed",
+            ).exists()
+        )
+    )
+    folder_stats = await build_folder_stats(session, watch)
     for folder in folder_stats:
         folder["first_seen_at"] = api_datetime(folder["first_seen_at"])
         folder["last_seen_at"] = api_datetime(folder["last_seen_at"])
     return {
         "watch": watch_dict(watch),
         "metrics": {
-            "files": sum(1 for item in files if item.exists),
-            "received_today": sum(1 for item in files if _aware(item.first_seen_at) >= start_today),
-            "updated_today": sum(
-                1 for item in events if item.event_type == EventType.UPDATED and _aware(item.event_time) >= start_today
-            ),
-            "deleted": sum(1 for item in files if not item.exists),
+            "files": files,
+            "received_today": received_today,
+            "updated_today": updated_today,
+            "deleted": deleted,
             "folders": len(folder_stats),
         },
-        "recent_files": [file_dict(item) for item in files[:10]],
+        "recent_files": [file_dict(item) for item in recent_files],
         "tree": folder_stats,
         "last_reconciliation": (
             {
@@ -330,6 +359,7 @@ async def watch_summary(
             ),
             "last_error": last_failed_run.error if last_failed_run else "",
             "last_error_at": api_datetime(last_failed_run.finished_at) if last_failed_run else None,
+            "last_error_resolved": bool(last_error_resolved),
         },
         "reconcile_interval_minutes": get_settings().reconcile_interval_minutes,
     }
@@ -376,6 +406,8 @@ async def watch_files(
     if date_to:
         conditions.append(FileRecord.first_seen_at <= date_to)
     total = await session.scalar(select(func.count(FileRecord.id)).where(*conditions)) or 0
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
     items = list(
         (
             await session.scalars(
@@ -392,7 +424,7 @@ async def watch_files(
         "page": page,
         "page_size": page_size,
         "total": total,
-        "pages": max(1, math.ceil(total / page_size)),
+        "pages": pages,
     }
 
 
@@ -460,10 +492,7 @@ async def watch_tree(
     session: AsyncSession = Depends(get_session),
 ):
     watch = await _watch(session, watch_id, current_user)
-    files = list((await session.scalars(select(FileRecord).where(FileRecord.watch_id == watch_id))).all())
-    events = list((await session.scalars(select(ActivityEvent).where(ActivityEvent.watch_id == watch_id))).all())
-    folder_records = list((await session.scalars(select(FolderRecord).where(FolderRecord.watch_id == watch_id))).all())
-    return {"items": build_folder_stats(watch, files, events, folder_records)}
+    return {"items": await build_folder_stats(session, watch)}
 
 
 @router.post("/{watch_id}/reconcile")

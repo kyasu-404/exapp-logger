@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from urllib.parse import quote
@@ -11,15 +11,26 @@ from xml.etree import ElementTree
 
 from sqlalchemy import select
 
-from ..activity_keys import activity_event_key
+from ..activity_keys import activity_event_key, revision_identity
 from ..db import SessionFactory
 from ..models import ActivityEvent, EventType, FileRecord, FolderRecord, ReconciliationRun, Watch, WatchStatus
-from .events import NodeSnapshot, _optional_timestamp, normalize_path, relative_to_watch
+from .events import (
+    NodeSnapshot,
+    _optional_timestamp,
+    last_activity_id,
+    normalize_path,
+    relative_to_watch,
+    watch_state_locks,
+)
 
 LOGGER = logging.getLogger(__name__)
 UPLOAD_TIME_TAG = "{http://nextcloud.org/ns}upload_time"
 FILE_ID_TAG = "{http://owncloud.org/ns}fileid"
 _LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+class SnapshotSuperseded(Exception):
+    """The watch changed while its DAV tree was being collected."""
 
 
 def utcnow() -> datetime:
@@ -158,7 +169,8 @@ async def _event(
     node_type: str = "file",
     size: int = 0,
     etag: str = "",
-) -> None:
+    existing_node_transition: bool = False,
+) -> bool:
     occurred_at = event_time or utcnow()
     resolved_watch_id = file.watch_id if file else watch_id
     if resolved_watch_id is None:
@@ -166,7 +178,9 @@ async def _event(
     identity = node_identity or (file.nextcloud_file_id if file else "") or (str(file.id) if file else path)
     resolved_etag = etag or (file.etag if file else "")
     if event_type == EventType.UPDATED:
-        identity = f"{identity}:{resolved_etag or occurred_at.isoformat()}"
+        identity = revision_identity(
+            identity, resolved_etag, file.nextcloud_mtime if file else None, file.size if file else size
+        )
     key = activity_event_key(
         resolved_watch_id,
         event_type,
@@ -174,9 +188,10 @@ async def _event(
         path,
         old_path,
         occurred_at,
+        previous_activity_id=await last_activity_id(session, resolved_watch_id) if existing_node_transition else None,
     )
     if await session.scalar(select(ActivityEvent.id).where(ActivityEvent.event_key == key)):
-        return
+        return False
     session.add(
         ActivityEvent(
             watch_id=resolved_watch_id,
@@ -194,6 +209,7 @@ async def _event(
             raw_event={"source": "reconciliation"},
         )
     )
+    return True
 
 
 def watch_is_current(watch: Watch, moment: datetime | None = None) -> bool:
@@ -203,6 +219,39 @@ def watch_is_current(watch: Watch, moment: datetime | None = None) -> bool:
     return bool(
         watch.status == WatchStatus.ACTIVE and (started is None or started <= now) and (ended is None or now <= ended)
     )
+
+
+@asynccontextmanager
+async def _stable_dav_tree(watch: Watch):
+    from nc_py_api import AsyncNextcloudApp
+
+    for _ in range(2):
+        nc = AsyncNextcloudApp(user=watch.owner_user_id)
+        # Webhook timestamps have second precision. A later delivery can still
+        # describe a change made during the DAV request.
+        observed_at = utcnow().replace(microsecond=0)
+        snapshots = await _tree_snapshots(nc, watch.owner_user_id, watch.root_path)
+        async with watch_state_locks[watch.id], SessionFactory() as session:
+            current = await session.get(Watch, watch.id)
+            if current is None or not watch_is_current(current):
+                raise SnapshotSuperseded("Наблюдение изменилось во время сверки")
+            if (
+                current.last_webhook_at == watch.last_webhook_at
+                and current.root_path == watch.root_path
+                and current.owner_user_id == watch.owner_user_id
+            ):
+                yield session, current, snapshots, observed_at
+                return
+            watch = current
+    raise SnapshotSuperseded("Во время сверки поступили новые события. Сверка будет повторена по расписанию.")
+
+
+def _index_nodes(records):
+    ordered = sorted(records, key=lambda record: (record.exists, record.id))
+    by_id = {record.nextcloud_file_id: record for record in ordered if record.nextcloud_file_id}
+    by_path = {record.full_path: record for record in ordered}
+    unidentified = {record.full_path: record for record in ordered if not record.nextcloud_file_id}
+    return by_id, by_path, unidentified
 
 
 async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[str, int | str]:
@@ -226,42 +275,31 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
             run_id = run.id
 
         try:
-            from nc_py_api import AsyncNextcloudApp
-
-            nc = AsyncNextcloudApp(user=watch.owner_user_id)
-            snapshots = await _tree_snapshots(nc, watch.owner_user_id, watch.root_path)
-            file_snapshots = [snapshot for snapshot in snapshots if not snapshot.is_dir]
-            folder_snapshots = [snapshot for snapshot in snapshots if snapshot.is_dir]
-            checked = len(snapshots)
-            created = updated = missing = 0
-            now = utcnow()
-
-            async with SessionFactory() as session:
-                watch = await session.get(Watch, watch_id)
-                if watch is None:
-                    raise ValueError("Наблюдение не найдено")
+            async with _stable_dav_tree(watch) as (session, watch, snapshots, now):
+                file_snapshots = [snapshot for snapshot in snapshots if not snapshot.is_dir]
+                folder_snapshots = [snapshot for snapshot in snapshots if snapshot.is_dir]
+                checked = len(snapshots)
+                created = updated = missing = 0
                 existing = list(
                     (await session.scalars(select(FileRecord).where(FileRecord.watch_id == watch_id))).all()
                 )
                 existing_folders = list(
                     (await session.scalars(select(FolderRecord).where(FolderRecord.watch_id == watch_id))).all()
                 )
-                by_id = {file.nextcloud_file_id: file for file in existing if file.nextcloud_file_id}
-                by_path = {file.full_path: file for file in existing}
+                by_id, by_path, unidentified = _index_nodes(existing)
                 seen_ids: set[int] = set()
 
-                folders_by_id = {
-                    folder.nextcloud_file_id: folder for folder in existing_folders if folder.nextcloud_file_id
-                }
-                folders_by_path = {folder.full_path: folder for folder in existing_folders}
+                folders_by_id, folders_by_path, unidentified_folders = _index_nodes(existing_folders)
                 seen_folder_ids: set[int] = set()
 
                 for snapshot in folder_snapshots:
                     relative = relative_to_watch(snapshot.path, watch.root_path)
                     if relative in (None, ""):
                         continue
-                    folder = folders_by_id.get(snapshot.file_id) if snapshot.file_id else None
-                    folder = folder or folders_by_path.get(snapshot.path)
+                    folder = (
+                        folders_by_id.get(snapshot.file_id) or unidentified_folders.get(snapshot.path)
+                        if snapshot.file_id else folders_by_path.get(snapshot.path)
+                    )
                     if folder is None:
                         folder = FolderRecord(
                             watch_id=watch_id,
@@ -307,13 +345,16 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                                 watch_id=watch_id,
                                 node_identity=snapshot.file_id or str(folder.id),
                                 node_type="folder",
+                                existing_node_transition=True,
                             )
                             updated += 1
                     seen_folder_ids.add(folder.id)
 
                 for snapshot in file_snapshots:
-                    file = by_id.get(snapshot.file_id) if snapshot.file_id else None
-                    file = file or by_path.get(snapshot.path)
+                    file = (
+                        by_id.get(snapshot.file_id) or unidentified.get(snapshot.path)
+                        if snapshot.file_id else by_path.get(snapshot.path)
+                    )
                     relative, parent, extension = _parts(watch, snapshot)
                     if file is None:
                         file = FileRecord(
@@ -343,8 +384,6 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                             file, snapshot, relative, parent, extension
                         )
                         if path_changed or content_changed or restored or metadata_changed:
-                            if content_changed and file.etag:
-                                file.revision_count += 1
                             if path_changed or content_changed or restored:
                                 file.last_seen_at = now
                             if path_changed or content_changed or restored:
@@ -355,14 +394,17 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                                     if restored
                                     else EventType.UPDATED
                                 )
-                                await _event(
+                                recorded = await _event(
                                     session,
                                     file,
                                     event_type,
                                     snapshot.path,
                                     triggered_by,
                                     old_path=old_path if path_changed else "",
+                                    existing_node_transition=path_changed or restored,
                                 )
+                                if recorded and content_changed:
+                                    file.revision_count += 1
                             updated += 1
                     seen_ids.add(file.id)
 
@@ -379,6 +421,7 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                         file.full_path,
                         triggered_by,
                         old_path=file.full_path,
+                        existing_node_transition=True,
                     )
                     missing += 1
 
@@ -398,6 +441,7 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                         watch_id=watch_id,
                         node_identity=folder.nextcloud_file_id or str(folder.id),
                         node_type="folder",
+                        existing_node_transition=True,
                     )
                     missing += 1
 
@@ -426,6 +470,14 @@ async def reconcile_watch(watch_id: int, triggered_by: str = "system") -> dict[s
                 "updated": updated,
                 "missing": missing,
             }
+        except SnapshotSuperseded as exc:
+            async with SessionFactory() as session:
+                skipped_run = await session.get(ReconciliationRun, run_id)
+                if skipped_run:
+                    skipped_run.status = "superseded"
+                    skipped_run.finished_at = utcnow()
+                    await session.commit()
+            return {"status": "skipped", "reason": str(exc), "checked": 0, "created": 0, "updated": 0, "missing": 0}
         except Exception as exc:
             LOGGER.exception("Ошибка сверки наблюдения %s", watch_id)
             async with SessionFactory() as session:

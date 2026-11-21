@@ -69,6 +69,17 @@ def _header_cells(sheet, values: Iterable[Any]):
     return cells
 
 
+def _append_row(sheet, values: Iterable[Any]) -> None:
+    cells = []
+    for value in values:
+        if isinstance(value, str):
+            cell = WriteOnlyCell(sheet, value=value)
+            cell.data_type = "s"
+            value = cell
+        cells.append(value)
+    sheet.append(cells)
+
+
 def _configure_table(sheet, widths: list[int], rows: int, columns: int) -> None:
     sheet.freeze_panes = "A2"
     if rows:
@@ -268,7 +279,8 @@ async def build_xlsx(session: AsyncSession, watch_id: int, filters: dict[str, An
     )
     async for file in file_stream:
         parts = [part for part in PurePosixPath(file.parent_path).parts if part not in {"/", "", "."}]
-        file_sheet.append(
+        _append_row(
+            file_sheet,
             [
                 *parts,
                 *([None] * (max_depth - len(parts))),
@@ -310,7 +322,8 @@ async def build_xlsx(session: AsyncSession, watch_id: int, filters: dict[str, An
         .execution_options(yield_per=500)
     )
     async for event in event_stream:
-        event_sheet.append(
+        _append_row(
+            event_sheet,
             [
                 _date_cell(event_sheet, event.event_time),
                 EVENT_LABELS[event.event_type.value],
@@ -335,7 +348,8 @@ async def build_xlsx(session: AsyncSession, watch_id: int, filters: dict[str, An
     folder_sheet.append(_header_cells(folder_sheet, folder_headers))
     folders = sorted(folder_data.values(), key=lambda row: row["path"].casefold())
     for folder in folders:
-        folder_sheet.append(
+        _append_row(
+            folder_sheet,
             [
                 folder["path"],
                 folder["files"],
@@ -378,6 +392,11 @@ def _csv_value(value: Any) -> Any:
     if isinstance(value, datetime):
         local_value = as_local_naive(value)
         return local_value.strftime("%d.%m.%Y %H:%M") if local_value else ""
+    if isinstance(value, str) and (
+        value.startswith(("\t", "\r", "\n"))
+        or value.lstrip().startswith(("=", "+", "-", "@", "＝", "＋", "－", "＠"))
+    ):
+        return "'" + value
     return value
 
 
@@ -394,8 +413,12 @@ async def build_csv(
     output = _temp_report(".csv")
     with output.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+
+        def write_row(values):
+            writer.writerow(map(_csv_value, values))
+
         if table == "events":
-            writer.writerow(
+            write_row(
                 [
                     "Время",
                     "Действие",
@@ -413,9 +436,9 @@ async def build_csv(
                 .execution_options(yield_per=500)
             )
             async for event in events:
-                writer.writerow(
+                write_row(
                     [
-                        _csv_value(event.event_time),
+                        event.event_time,
                         EVENT_LABELS[event.event_type.value],
                         "Папка" if event.node_type == "folder" else "Файл",
                         event.path or event.new_path,
@@ -425,7 +448,7 @@ async def build_csv(
                     ]
                 )
         elif table == "folders":
-            writer.writerow(["Путь папки", "Файлов", "Первое поступление", "Последнее поступление", "Размер"])
+            write_row(["Путь папки", "Файлов", "Первое поступление", "Последнее поступление", "Размер"])
             folder_data: dict[str, dict[str, Any]] = {}
             folders = await session.stream_scalars(
                 select(FolderRecord).where(*_folder_conditions(watch_id, filters)).execution_options(yield_per=500)
@@ -438,17 +461,17 @@ async def build_csv(
             async for file in files:
                 _accumulate_file(folder_data, file)
             for folder in sorted(folder_data.values(), key=lambda row: row["path"].casefold()):
-                writer.writerow(
+                write_row(
                     [
                         folder["path"],
                         folder["files"],
-                        _csv_value(folder["first_seen_at"]),
-                        _csv_value(folder["last_seen_at"]),
+                        folder["first_seen_at"],
+                        folder["last_seen_at"],
                         human_size(folder["size"]),
                     ]
                 )
         else:
-            writer.writerow(
+            write_row(
                 [
                     "Путь",
                     "Файл",
@@ -467,14 +490,14 @@ async def build_csv(
                 .execution_options(yield_per=500)
             )
             async for file in files:
-                writer.writerow(
+                write_row(
                     [
                         file.full_path,
                         file.filename,
-                        _csv_value(file.first_seen_at),
-                        _csv_value(file.last_seen_at),
-                        _csv_value(file.nextcloud_upload_time),
-                        _csv_value(file.nextcloud_mtime),
+                        file.first_seen_at,
+                        file.last_seen_at,
+                        file.nextcloud_upload_time,
+                        file.nextcloud_mtime,
                         human_size(file.size),
                         STATUS_LABELS[file_state(file)],
                     ]
@@ -522,10 +545,10 @@ async def build_changes_xlsx(
     workbook = Workbook(write_only=True)
     summary = workbook.create_sheet("Итоги")
     summary.append(_header_cells(summary, ["Показатель", "Значение"]))
-    summary.append(["Наблюдение", watch.name])
+    _append_row(summary, ["Наблюдение", watch.name])
     summary.append(["Период с", _date_cell(summary, date_from)])
     summary.append(["Период по", _date_cell(summary, date_to)])
-    summary.append(["Ветка", path_prefix or "Всё наблюдение"])
+    _append_row(summary, ["Ветка", path_prefix or "Всё наблюдение"])
     for label, count in counts.items():
         summary.append([label, count])
     _configure_table(summary, [28, 60], 8, 2)
@@ -540,7 +563,8 @@ async def build_changes_xlsx(
         .execution_options(yield_per=500)
     )
     async for event in events:
-        changes.append(
+        _append_row(
+            changes,
             [
                 _date_cell(changes, event.event_time),
                 CHANGE_CATEGORIES[event.event_type],

@@ -44,6 +44,8 @@ const folderVerified = ref(false)
 const selectedBranch = ref('')
 const reportSchedule = ref(null)
 let refreshTimer = 0
+let fileRequestId = 0
+let requestedFilePage = 1
 const REFRESH_INTERVAL_MS = 15000
 
 const fileFilters = reactive({
@@ -54,6 +56,7 @@ const fileFilters = reactive({
   date_to: '',
   path_prefix: '',
 })
+let appliedFileFilters = { ...fileFilters }
 const eventFilters = reactive({
   search: '',
   event_type: '',
@@ -204,18 +207,35 @@ function requestDates(filters) {
   }
 }
 
-async function loadFiles(page = 1) {
-  if (!selectedWatchId.value) {
+async function loadFiles(page = requestedFilePage) {
+  const requestId = ++fileRequestId
+  const watchId = selectedWatchId.value
+  requestedFilePage = page
+  if (!watchId) {
     filesPage.value = { items: [], page: 1, pages: 1, total: 0 }
     return
   }
   const params = {
     page,
     page_size: 50,
-    ...fileFilters,
-    ...requestDates(fileFilters),
+    ...appliedFileFilters,
+    ...requestDates(appliedFileFilters),
   }
-  filesPage.value = await api(`/api/watches/${selectedWatchId.value}/files?${query(params)}`)
+  const isCurrent = () => requestId === fileRequestId && watchId === selectedWatchId.value
+  try {
+    const result = await api(`/api/watches/${watchId}/files?${query(params)}`)
+    if (isCurrent()) {
+      filesPage.value = result
+      requestedFilePage = result.page
+    }
+  } catch (err) {
+    if (isCurrent()) throw err
+  }
+}
+
+function applyFileFilters() {
+  appliedFileFilters = { ...fileFilters }
+  return run(() => loadFiles(1))
 }
 
 async function loadEvents(page = 1) {
@@ -384,7 +404,7 @@ async function reconcile() {
     const result = await api(`/api/watches/${selectedWatchId.value}/reconcile`, { method: 'POST' })
     const refreshes = [loadSummary(), loadDashboard()]
     if (section.value === 'activity') refreshes.push(loadEvents(eventsPage.value.page || 1))
-    if (section.value === 'files') refreshes.push(loadFiles(filesPage.value.page || 1))
+    if (section.value === 'files') refreshes.push(loadFiles())
     await Promise.all(refreshes)
     showToast(`Сверка завершена: проверено ${result.checked}, новых ${result.created}, изменённых ${result.updated}`)
   })
@@ -397,6 +417,9 @@ function selectWatch(id) {
 function chooseBranch(path) {
   selectedBranch.value = path
   fileFilters.path_prefix = path
+  appliedFileFilters = { ...appliedFileFilters, path_prefix: path }
+  requestedFilePage = 1
+  fileRequestId += 1
   eventFilters.path_prefix = path
 }
 
@@ -534,6 +557,9 @@ watch(section, refreshSection)
 watch(selectedWatchId, async (value) => {
   localStorage.setItem('file-control-watch', String(value || 0))
   selectedBranch.value = ''
+  requestedFilePage = 1
+  fileRequestId += 1
+  filesPage.value = { items: [], page: 1, pages: 1, total: 0 }
   if (value) await refreshSection()
 })
 
@@ -639,7 +665,14 @@ onBeforeUnmount(() => {
               <div><dt>Последний webhook</dt><dd>{{ fmtDate(summary?.diagnostics?.last_webhook_at) }}</dd></div>
               <div><dt>Длительность сверки</dt><dd>{{ fmtDuration(summary?.diagnostics?.reconciliation_duration_seconds) }}</dd></div>
               <div><dt>Расхождений</dt><dd>{{ summary?.diagnostics?.discrepancies ?? '—' }}</dd></div>
-              <div><dt>Последняя ошибка</dt><dd :class="{ 'diagnostic-error': summary?.diagnostics?.last_error }">{{ summary?.diagnostics?.last_error || 'Ошибок нет' }}</dd></div>
+              <div>
+                <dt>Последняя ошибка</dt>
+                <dd :class="{ 'diagnostic-error': summary?.diagnostics?.last_error && !summary?.diagnostics?.last_error_resolved }">
+                  {{ summary?.diagnostics?.last_error || 'Ошибок нет' }}
+                  <small v-if="summary?.diagnostics?.last_error_at">{{ fmtDate(summary.diagnostics.last_error_at) }}</small>
+                  <small v-if="summary?.diagnostics?.last_error_resolved">После ошибки сверка прошла успешно</small>
+                </dd>
+              </div>
             </dl>
           </section>
 
@@ -715,13 +748,13 @@ onBeforeUnmount(() => {
 
       <template v-else-if="section === 'files'">
         <section v-if="currentWatch" class="filter-bar">
-          <input v-model="fileFilters.search" placeholder="Поиск по пути или имени" @keyup.enter="loadFiles(1)" />
-          <input v-model="fileFilters.path_prefix" placeholder="Путь начинается с…" @keyup.enter="loadFiles(1)" />
-          <input v-model="fileFilters.extension" class="short" placeholder="Тип: xlsx" @keyup.enter="loadFiles(1)" />
+          <input v-model="fileFilters.search" placeholder="Поиск по пути или имени" @keyup.enter="applyFileFilters" />
+          <input v-model="fileFilters.path_prefix" placeholder="Путь начинается с…" @keyup.enter="applyFileFilters" />
+          <input v-model="fileFilters.extension" class="short" placeholder="Тип: xlsx" @keyup.enter="applyFileFilters" />
           <select v-model="fileFilters.status"><option value="">Все состояния</option><option value="new">Новые</option><option value="updated">Обновлённые</option><option value="deleted">Удалённые</option></select>
           <input v-model="fileFilters.date_from" type="date" title="Дата от" />
           <input v-model="fileFilters.date_to" type="date" title="Дата до" />
-          <button class="primary" @click="loadFiles(1)">Применить</button>
+          <button class="primary" @click="applyFileFilters">Применить</button>
         </section>
         <section class="panel table-panel">
           <div class="panel-title"><div><h2>Файлы</h2><p>{{ filesPage.total }} записей</p></div></div>

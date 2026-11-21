@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     app_id: str = Field(default="file_control", validation_alias="APP_ID")
-    app_version: str = Field(default="2.3.0", validation_alias="APP_VERSION")
+    app_version: str = Field(default="2.3.1", validation_alias="APP_VERSION")
     app_display_name: str = Field(default="Отчёт сдачи", validation_alias="APP_DISPLAY_NAME")
     app_persistent_storage: str = Field(default="./data", validation_alias="APP_PERSISTENT_STORAGE")
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")

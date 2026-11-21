@@ -39,8 +39,8 @@ XLSX содержит листы «Файлы», «Активность», «П�
 ## Сборка контейнера
 
 ~~~bash
-docker build -t registry.example.org/nextcloud/file-control:2.3.0 .
-docker push registry.example.org/nextcloud/file-control:2.3.0
+docker build -t registry.example.org/nextcloud/file-control:2.3.1 .
+docker push registry.example.org/nextcloud/file-control:2.3.1
 ~~~
 
 Перед регистрацией замените в appinfo/info.xml значения registry, image и image-tag на адрес опубликованного образа.

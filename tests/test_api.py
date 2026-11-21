@@ -53,6 +53,7 @@ def test_health_watch_and_reports() -> None:
             "discrepancies": None,
             "last_error": "",
             "last_error_at": None,
+            "last_error_resolved": False,
         }
 
         xlsx = client.get("/api/reports/xlsx", params={"watch_id": watch["id"]})

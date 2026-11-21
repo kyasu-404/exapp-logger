@@ -8,7 +8,7 @@
 		и удаление файлов на любой глубине выбранной папки, хранит полные пути
 		и формирует универсальные отчёты XLSX/CSV.
 	]]></description>
-	<version>2.3.0</version>
+	<version>2.3.1</version>
 	<licence>agpl</licence>
 	<author>ExApp File Control contributors</author>
 	<namespace>FileControl</namespace>
@@ -20,7 +20,7 @@
 		<docker-install>
 			<registry>ghcr.io</registry>
 			<image>kyasu-404/file-control</image>
-			<image-tag>2.3.0</image-tag>
+			<image-tag>2.3.1</image-tag>
 		</docker-install>
 		<routes>
 			<route>

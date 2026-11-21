@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
+from collections import defaultdict
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -10,10 +13,10 @@ from typing import Any
 from urllib.parse import quote
 from xml.etree import ElementTree
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..activity_keys import activity_event_key
+from ..activity_keys import activity_event_key, revision_identity
 from ..db import SessionFactory
 from ..models import ActivityEvent, EventType, FileRecord, FolderRecord, Watch, WatchStatus
 
@@ -30,6 +33,7 @@ FULL_EVENT_CLASSES = {name: f"OCP\\Files\\Events\\Node\\{name}" for name in EVEN
 USER_FILE_RE = re.compile(r"^/?(?P<user>[^/]+)/files/(?P<path>.*)$")
 UPLOAD_TIME_TAG = "{http://nextcloud.org/ns}upload_time"
 _GROUP_CACHE: dict[str, tuple[float, set[str]]] = {}
+watch_state_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def utcnow() -> datetime:
@@ -160,7 +164,9 @@ async def normalize_event(payload: dict[str, Any]) -> NormalizedEvent:
         target = _legacy_node(event_data.get("target") or {})
         source_data = event_data.get("source")
         source = _legacy_node(source_data) if source_data else None
-        return NormalizedEvent(subtype, EVENT_MAP[subtype], target, source, utcnow(), target.owner_user_id, payload)
+        return NormalizedEvent(
+            subtype, EVENT_MAP[subtype], target, source, _timestamp(payload.get("time")), target.owner_user_id, payload
+        )
 
     envelope = payload.get("event") or {}
     event_class = str(envelope.get("class") or "")
@@ -214,11 +220,14 @@ async def enrich_snapshot(snapshot: NodeSnapshot) -> NodeSnapshot:
             node = await nc.files.by_path(snapshot.path.lstrip("/"))
         if node is None:
             return snapshot
+        node_id = str(node.info.fileid or "") or None
+        if snapshot.file_id and node_id and node_id != snapshot.file_id:
+            return snapshot
         path = normalize_path(node.user_path)
         return NodeSnapshot(
             owner_user_id=snapshot.owner_user_id,
             path=path,
-            file_id=str(node.info.fileid or snapshot.file_id or "") or None,
+            file_id=snapshot.file_id or node_id,
             etag=node.etag_unquoted,
             mime_type=node.info.mimetype or "application/octet-stream",
             size=int(node.info.content_length or node.info.size or 0),
@@ -267,21 +276,41 @@ def _scope_accepts_owner(watch: Watch, node_owner: str, actor_groups: set[str]) 
     return node_owner == watch.owner_user_id or bool(set(watch.group_ids or []).intersection(actor_groups))
 
 
-async def _find_file(session: AsyncSession, watch_id: int, snapshot: NodeSnapshot) -> FileRecord | None:
-    predicates = [FileRecord.full_path == snapshot.path]
+async def _find_node[NodeRecord: (FileRecord, FolderRecord)](
+    session: AsyncSession,
+    model: type[NodeRecord],
+    watch_id: int,
+    snapshot: NodeSnapshot,
+    *,
+    deleting: bool = False,
+) -> NodeRecord | None:
+    query = select(model).where(model.watch_id == watch_id)
+    by_path = model.full_path == snapshot.path
     if snapshot.file_id:
-        predicates.insert(0, FileRecord.nextcloud_file_id == snapshot.file_id)
-    return await session.scalar(
-        select(FileRecord).where(FileRecord.watch_id == watch_id, or_(*predicates)).order_by(FileRecord.id.desc())
+        by_id = model.nextcloud_file_id == snapshot.file_id
+        match = await session.scalar(query.where(by_id))
+        if match is not None:
+            return match
+        if deleting and await session.scalar(
+            select(model.id)
+            .where(model.watch_id == watch_id, by_path, model.exists.is_(True), model.nextcloud_file_id.is_not(None))
+            .limit(1)
+        ):
+            return None
+        query = query.where(model.nextcloud_file_id.is_(None))
+    return await session.scalar(query.where(by_path).order_by(model.exists.desc(), model.id.desc()).limit(1))
+
+
+def _already_present(record: FileRecord | FolderRecord, snapshot: NodeSnapshot) -> bool:
+    return (
+        record.exists and record.full_path == snapshot.path
+        and (not snapshot.file_id or record.nextcloud_file_id == snapshot.file_id)
     )
 
 
-async def _find_folder(session: AsyncSession, watch_id: int, snapshot: NodeSnapshot) -> FolderRecord | None:
-    predicates = [FolderRecord.full_path == snapshot.path]
-    if snapshot.file_id:
-        predicates.insert(0, FolderRecord.nextcloud_file_id == snapshot.file_id)
+async def last_activity_id(session: AsyncSession, watch_id: int) -> int | None:
     return await session.scalar(
-        select(FolderRecord).where(FolderRecord.watch_id == watch_id, or_(*predicates)).order_by(FolderRecord.id.desc())
+        select(ActivityEvent.id).where(ActivityEvent.watch_id == watch_id).order_by(ActivityEvent.id.desc()).limit(1)
     )
 
 
@@ -294,10 +323,13 @@ async def _record_activity(
     snapshot: NodeSnapshot,
     old_path: str = "",
     node_type: str = "file",
+    *,
+    existing_node_transition: bool = False,
 ) -> bool:
     node_identity = snapshot.file_id or (file.nextcloud_file_id if file else None)
     if event_type == EventType.UPDATED:
-        node_identity = f"{node_identity or (file.id if file else snapshot.path)}:{snapshot.etag or snapshot.mtime}"
+        file_identity = node_identity or (file.id if file else snapshot.path)
+        node_identity = revision_identity(file_identity, snapshot.etag, snapshot.mtime, snapshot.size)
     key = activity_event_key(
         watch.id,
         event_type,
@@ -305,6 +337,7 @@ async def _record_activity(
         snapshot.path,
         old_path,
         event.occurred_at,
+        previous_activity_id=await last_activity_id(session, watch.id) if existing_node_transition else None,
     )
     if await session.scalar(select(ActivityEvent.id).where(ActivityEvent.event_key == key)):
         return False
@@ -350,8 +383,15 @@ async def _upsert_file(
     if snapshot.is_dir:
         return await _upsert_folder(session, watch, event, event_type, snapshot, old_path)
     relative, parent, extension = _file_parts(watch, snapshot)
-    file = await _find_file(session, watch.id, snapshot)
+    file = await _find_node(session, FileRecord, watch.id, snapshot)
     is_new = file is None
+    if file is not None:
+        if _aware(event.occurred_at) < _aware(file.last_seen_at):
+            return False
+        if not file.exists and event_type == EventType.UPDATED:
+            event_type = EventType.CREATED
+        if event_type != EventType.UPDATED and _already_present(file, snapshot):
+            return False
     if file is None:
         file = FileRecord(
             watch_id=watch.id,
@@ -372,21 +412,21 @@ async def _upsert_file(
         )
         session.add(file)
         await session.flush()
-    old_etag = file.etag
-    old_size = file.size
-    old_mtime = file.nextcloud_mtime
     if event_type == EventType.UPDATED:
         changed = is_new or any(
             (
-                bool(snapshot.etag and snapshot.etag != old_etag),
-                snapshot.size != old_size,
-                bool(snapshot.mtime and snapshot.mtime != old_mtime),
+                bool(snapshot.etag and snapshot.etag != file.etag),
+                snapshot.size != file.size,
+                bool(snapshot.mtime and _aware(snapshot.mtime) != _aware(file.nextcloud_mtime)),
             )
         )
         if not changed:
             return False
-        await _record_activity(session, watch, file, event, event_type, snapshot, old_path)
-    elif not await _record_activity(session, watch, file, event, event_type, snapshot, old_path):
+    recorded = await _record_activity(
+        session, watch, file, event, event_type, snapshot, old_path,
+        existing_node_transition=not is_new and event_type != EventType.UPDATED,
+    )
+    if not recorded and event_type != EventType.UPDATED:
         return False
 
     file.nextcloud_file_id = snapshot.file_id or file.nextcloud_file_id
@@ -403,7 +443,7 @@ async def _upsert_file(
     file.last_seen_at = event.occurred_at
     file.exists = True
     file.deleted_at = None
-    if event_type == EventType.UPDATED and not is_new:
+    if recorded and event_type == EventType.UPDATED and not is_new:
         file.revision_count += 1
     return True
 
@@ -419,8 +459,15 @@ async def _upsert_folder(
     relative = relative_to_watch(snapshot.path, watch.root_path)
     if relative is None or relative == "":
         return False
-    folder = await _find_folder(session, watch.id, snapshot)
-    if not await _record_activity(session, watch, None, event, event_type, snapshot, old_path, node_type="folder"):
+    folder = await _find_node(session, FolderRecord, watch.id, snapshot)
+    if folder is not None and (
+        _aware(event.occurred_at) < _aware(folder.last_seen_at) or _already_present(folder, snapshot)
+    ):
+        return False
+    if not await _record_activity(
+        session, watch, None, event, event_type, snapshot, old_path, node_type="folder",
+        existing_node_transition=folder is not None,
+    ):
         return False
     if folder is None:
         folder = FolderRecord(
@@ -454,9 +501,11 @@ async def _mark_missing(
 ) -> bool:
     if snapshot.is_dir:
         return await _mark_folder_missing(session, watch, event, event_type, snapshot, new_path)
-    file = await _find_file(session, watch.id, snapshot)
+    file = await _find_node(session, FileRecord, watch.id, snapshot, deleting=True)
     if file is None:
         return await _mark_folder_missing(session, watch, event, event_type, snapshot, new_path)
+    if not file.exists or _aware(event.occurred_at) < _aware(file.last_seen_at):
+        return False
     target = NodeSnapshot(
         owner_user_id=snapshot.owner_user_id,
         path=new_path or snapshot.path,
@@ -467,8 +516,11 @@ async def _mark_missing(
         mtime=file.nextcloud_mtime,
         upload_time=file.nextcloud_upload_time,
     )
-    if not await _record_activity(session, watch, file, event, event_type, target, snapshot.path):
+    if not await _record_activity(
+        session, watch, file, event, event_type, target, snapshot.path, existing_node_transition=True
+    ):
         return False
+    file.nextcloud_file_id = snapshot.file_id or file.nextcloud_file_id
     file.exists = False
     file.deleted_at = event.occurred_at
     file.last_seen_at = event.occurred_at
@@ -483,8 +535,8 @@ async def _mark_folder_missing(
     snapshot: NodeSnapshot,
     new_path: str = "",
 ) -> bool:
-    folder = await _find_folder(session, watch.id, snapshot)
-    if folder is None:
+    folder = await _find_node(session, FolderRecord, watch.id, snapshot, deleting=True)
+    if folder is None or not folder.exists or _aware(event.occurred_at) < _aware(folder.last_seen_at):
         return False
     target = NodeSnapshot(
         owner_user_id=snapshot.owner_user_id,
@@ -492,8 +544,12 @@ async def _mark_folder_missing(
         file_id=snapshot.file_id or folder.nextcloud_file_id,
         is_dir=True,
     )
-    if not await _record_activity(session, watch, None, event, event_type, target, snapshot.path, node_type="folder"):
+    if not await _record_activity(
+        session, watch, None, event, event_type, target, snapshot.path, node_type="folder",
+        existing_node_transition=True,
+    ):
         return False
+    folder.nextcloud_file_id = snapshot.file_id or folder.nextcloud_file_id
     folder.exists = False
     folder.deleted_at = event.occurred_at
     folder.last_seen_at = event.occurred_at
@@ -513,11 +569,25 @@ async def process_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     matched = changed = 0
     async with SessionFactory() as session:
         watches = await _active_watches(session)
-        actor_groups = (
-            await _event_user_groups(event.actor_user_id or event.target.owner_user_id)
-            if any(watch.scope_type == "team" for watch in watches)
-            else set()
-        )
+    event_paths = [node.path for node in (event.target, event.source) if node]
+    watch_ids = sorted(
+        watch.id for watch in watches
+        if any(relative_to_watch(path, watch.root_path) is not None for path in event_paths)
+    )
+    if not watch_ids:
+        return {"matched": 0, "changed": 0}
+    actor_groups = (
+        await _event_user_groups(event.actor_user_id or event.target.owner_user_id)
+        if any(watch.scope_type == "team" and watch.id in watch_ids for watch in watches)
+        else set()
+    )
+    async with AsyncExitStack() as locks:
+        for watch_id in watch_ids:
+            await locks.enter_async_context(watch_state_locks[watch_id])
+        session = await locks.enter_async_context(SessionFactory())
+        watches = (await session.scalars(
+            select(Watch).where(Watch.id.in_(watch_ids), Watch.status == WatchStatus.ACTIVE)
+        )).all()
         for watch in watches:
             if not _watch_accepts_event(watch, event.occurred_at):
                 continue

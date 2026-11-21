@@ -981,6 +981,11 @@
   color: #d33d3d !important;
 }
 
+.diagnostics-panel dd small {
+  display: block;
+  margin-top: 4px;
+}
+
 .changes-report {
   grid-column: 1 / -1;
 }
